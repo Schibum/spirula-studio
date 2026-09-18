@@ -341,6 +341,7 @@ void forward_3dgs(
     // ellipse-vs-tile test instead of the conservative AABB one.
     ProjEllipseView ellipse = proj_ellipse_view(
         engine().fwd.splats_s[0].data_ptr(), primitive == "3dgut");
+    ellipse.mult = engine().fwd.fastgs_mult;
 
     auto& bin = bin_choice();
     engine().fwd.macro_log2 = engine_bin_macro_log2();

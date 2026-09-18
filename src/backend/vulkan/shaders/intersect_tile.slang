@@ -141,6 +141,8 @@ struct IsectCountParams {  // pushed directly
     uint32_t macro_log2;       // binning tile = TILE_MICRO_X << macro_log2
     // Row layout of proj_screen; xy_off < 0 -> center from the AABB.
     int32_t row_stride, xy_off, conic_off, opac_off;
+    float fastgs_mult;
+    uint _pad0;
 };
 
 // Mode flags as specialization constants. Spec-folded so no load ever sits
@@ -171,13 +173,17 @@ void intersect_tile_count(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         if (!aabb16_is_empty(aabb_q)) {
             float4 aabb =
                 aabb16_decode(aabb_q, p.image_width, p.image_height);
-            BinTile bt = bin_tile(p.macro_log2);
-            uint2 tile_min, tile_max;
-            tile_range(aabb, p.tile_width, p.tile_height, bt, tile_min,
-                       tile_max);
-
+            BinTile bt = bin_tile(int(p.macro_log2));
+            uint2 tile_min = uint2(clamp(uint(floor(aabb.x * bt.inv_x)), 0u,
+                                         p.tile_width),
+                                   clamp(uint(floor(aabb.y * bt.inv_y)), 0u,
+                                         p.tile_height));
+            uint2 tile_max = uint2(clamp(uint(ceil(aabb.z * bt.inv_x)), 0u,
+                                         p.tile_width),
+                                   clamp(uint(ceil(aabb.w * bt.inv_y)), 0u,
+                                         p.tile_height));
             gindex_t iid = kPacked != 0 ? gindex_t(p.image_ids[idx])
-                                        : gindex_t(idx / p.N);
+                                         : gindex_t(idx / p.N);
             gindex_t tile_base =
                 iid * gindex_t(p.tile_width) * gindex_t(p.tile_height);
 
@@ -188,8 +194,9 @@ void intersect_tile_count(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                     : float2(0.5f * (aabb.x + aabb.z),
                              0.5f * (aabb.y + aabb.w));
                 float3 conic = float3(row[p.conic_off], row[p.conic_off + 1],
-                                      row[p.conic_off + 2]);
-                conic = conic * (0.5f / log(row[p.opac_off] / ALPHA_THRESHOLD));
+                              row[p.conic_off + 2]);
+                float eff_mult = p.fastgs_mult > 0.0f ? p.fastgs_mult : 1.0f;
+                conic = conic * (0.5f / (eff_mult * log(row[p.opac_off] / ALPHA_THRESHOLD)));
                 n = count_ellipse_grid_overlaps(
                     xy, conic,
                     int(tile_min.x), int(tile_max.x), int(tile_min.y),
@@ -295,6 +302,7 @@ struct IsectWriteParams {  // pushed directly
     uint32_t n_isects;   // isect_ids / flatten_ids length
     uint32_t macro_log2;
     int32_t row_stride, xy_off, conic_off, opac_off;
+    float fastgs_mult;
 };
 
 [shader("compute")]
@@ -347,7 +355,8 @@ void intersect_tile_write(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             : float2(0.5f * (aabb.x + aabb.z), 0.5f * (aabb.y + aabb.w));
         float3 conic = float3(row[p.conic_off], row[p.conic_off + 1],
                               row[p.conic_off + 2]);
-        conic = conic * (0.5f / log(row[p.opac_off] / ALPHA_THRESHOLD));
+        float eff_mult = p.fastgs_mult > 0.0f ? p.fastgs_mult : 1.0f;
+        conic = conic * (0.5f / (eff_mult * log(row[p.opac_off] / ALPHA_THRESHOLD)));
 
         if (int(tile_max.y - tile_min.y) * bt.ix <=
             int(tile_max.x - tile_min.x) * bt.iy) {

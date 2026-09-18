@@ -138,6 +138,7 @@ static std::map<std::string, float> _engine_step_fwd_bwd_only(
     engine().ppisp.forward_pending =
         engine().ppisp.enabled && engine().ppisp.cur_run_before_color_space;
     engine().background.match_luma_pending = cfg.background.match_luminance;
+    engine().fwd.fastgs_mult = cfg.densify.fastgs_mult;
 
     forward_3dgs(primitive, sh_degree, packed, /*output_median=*/false, (int)dist_type);
 

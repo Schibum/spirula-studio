@@ -235,7 +235,9 @@ void relocate_splats_with_long_axis_split_tensor(
     // Non-SH Adam-state quant: when enabled, each relocated dst splat gets
     // its packed bytes set to codec-encoded zero against the current bound.
     NonShQuantState non_sh,
-    uint32_t seed
+    uint32_t seed,
+    bool fastgs_prune_active = false,
+    float fastgs_prune_score_threshold = 0.0f
 ) {
     int32_t* bias_correction_steps_ptr = bias_correction_steps.data_ptr();
     bool* mask = DevicePool::global().acquire<bool>(

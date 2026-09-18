@@ -279,14 +279,15 @@ int engine_densify_step(int step, int max_steps, const DensifyConfig& cfg) {
         auto& dv_sample_score = engine().optim.densify_sample_score;
         // Sized for the whole pool, not cur_num_splats: the oversize draw
         // adds splats that the second draw then has to rank.
-        if (cfg.final_score_power != 1.0f)
+        if (cfg.final_score_power != 1.0f || cfg.fastgs_densify)
             dv_sample_score.resize(PoolSlot::EngDensifySampleScore,
                                    max_num_splats);
         else
             dv_sample_score = DeviceVector<float2>();
         densify_clip_score_tensor(cur_num_splats, dv_accum_buf,
                                   cfg.score_clip_quantile,
-                                  cfg.final_score_power, dv_sample_score);
+                                  cfg.final_score_power, dv_sample_score,
+                                  cfg.fastgs_densify ? cfg.fastgs_min_views : 0);
     }
 
     int num_added = 0;
@@ -314,7 +315,9 @@ int engine_densify_step(int step, int max_steps, const DensifyConfig& cfg) {
             dv_sh_value_packed, dv_sh_value_bounds,
             sh_value_bits, sh_value_bounds_per_splat, num_sh_buffer,
             non_sh,
-            2 * step + 0
+            2 * step + 0,
+            cfg.fastgs_prune_active,
+            cfg.fastgs_prune_score_threshold
         );
 
         // Add more splats

@@ -77,11 +77,14 @@ static_assert(sizeof(EfraimidisParams) == 3 * 8 + 6 * 4,
 struct RelocMaskParams {
     uint64_t means, quats, scales, opacs, features_dc, mask, count,
         dst_indices;
+    uint64_t accum_buffer;
     float min_opacity;
+    float prune_score_thresh;
     uint32_t num_splats, wgs_per_row;
+    uint32_t prune_active;
     uint32_t _pad0;
 };
-static_assert(sizeof(RelocMaskParams) == 8 * 8 + 4 * 4,
+static_assert(sizeof(RelocMaskParams) == 9 * 8 + 6 * 4,
               "params layout must match the slang struct");
 
 // Mirrors RelocLasParams.
@@ -122,7 +125,7 @@ struct ScoreClipParams {
     uint64_t accum_buffer, cutoff, score_out;
     float power;
     uint32_t use_cutoff, use_out, num_splats, wgs_per_row;
-    uint32_t _pad0;
+    uint32_t min_views;
 };
 static_assert(sizeof(ScoreClipParams) == 3 * 8 + 6 * 4,
               "params layout must match the slang struct");
@@ -624,7 +627,9 @@ void relocate_splats_with_long_axis_split_tensor(
     bool sh_value_bounds_per_splat,
     int  num_sh_buffer,
     NonShQuantState non_sh,
-    uint32_t seed
+    uint32_t seed,
+    bool fastgs_prune_active,
+    float fastgs_prune_score_threshold
 ) {
     if (cur_num_splats <= 0) return;
 
@@ -645,8 +650,11 @@ void relocate_splats_with_long_axis_split_tensor(
     mp.mask = (uint64_t)mask.data_ptr();
     mp.count = (uint64_t)count.data_ptr();
     mp.dst_indices = (uint64_t)dst_indices.data_ptr();
+    mp.accum_buffer = (uint64_t)densify_accum_buffer.data_ptr();
     mp.min_opacity = min_opacity;
+    mp.prune_score_thresh = fastgs_prune_score_threshold;
     mp.num_splats = (uint32_t)cur_num_splats;
+    mp.prune_active = fastgs_prune_active ? 1u : 0u;
     vkk::dispatch_flat("densify.densify_reloc_mask", {}, cur_num_splats, 256,
                        &mp, sizeof(mp), &mp.wgs_per_row);
 
@@ -969,11 +977,12 @@ void densify_clip_score_tensor(int64_t num_splats,
                                DeviceVector<float2> accum_buffer,
                                float quantile,
                                float power,
-                               DeviceVector<float2> score_out) {
+                               DeviceVector<float2> score_out,
+                               int min_views) {
     if (num_splats <= 0 || accum_buffer.data_ptr() == nullptr) return;
     const bool do_clip = (quantile > 0.0f && quantile < 1.0f);
     float2* out = score_out.data_ptr();
-    if (!do_clip && out == nullptr) return;
+    if (!do_clip && out == nullptr && min_views <= 0) return;
 
     float* cutoff = nullptr;
     if (do_clip) {
@@ -1006,6 +1015,7 @@ void densify_clip_score_tensor(int64_t num_splats,
     p.use_cutoff = cutoff ? 1u : 0u;
     p.use_out = out ? 1u : 0u;
     p.num_splats = (uint32_t)num_splats;
+    p.min_views = min_views > 0 ? (uint32_t)min_views : 0u;
     vkk::dispatch_flat("densify.densify_clip_score", {}, num_splats, 256, &p,
                        sizeof(p), &p.wgs_per_row);
 }

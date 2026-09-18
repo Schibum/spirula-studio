@@ -449,6 +449,12 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.densify.las_split_opacity_k_init   = c.long_axis_split_opacity_k[0];
     cfg.densify.las_split_opacity_k_final  = c.long_axis_split_opacity_k[1];
     cfg.densify.las_split_opacity_k_warmup = (int)c.long_axis_split_opacity_k[2];
+    cfg.densify.fastgs_densify               = c.fastgs_densify;
+    cfg.densify.fastgs_min_views             = c.fastgs_min_views;
+    cfg.densify.fastgs_prune                 = c.fastgs_prune;
+    cfg.densify.fastgs_prune_active          = c.fastgs_prune && step >= c.fastgs_prune_start_iter && (step % c.fastgs_prune_interval == 0);
+    cfg.densify.fastgs_prune_score_threshold = c.fastgs_prune_score_threshold;
+    cfg.densify.fastgs_mult                  = c.fastgs_mult;
 
     // ---- bilagrid LRs + TV ---------------------------------------------
     if (st.bilagrid_rgb_init) {

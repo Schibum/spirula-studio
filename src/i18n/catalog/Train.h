@@ -371,6 +371,49 @@ SS_MSG(preset_academic_baseline_help,
     RU("Пресет, максимально точно воспроизводящий 3DGS MCMC."),
     TR("3DGS MCMC'yi olabildiğince sadık biçimde yeniden üreten hazır ayar."));
 
+SS_MSG(preset_fastgs,
+    EN("FastGS"),
+    JA("FastGS"),
+    ZH_HANS("FastGS"),
+    ZH_HANT("FastGS"),
+    KO("FastGS"),
+    DE("FastGS"),
+    FR("FastGS"),
+    ES("FastGS"),
+    PT("FastGS"),
+    IT("FastGS"),
+    NL("FastGS"),
+    RU("FastGS"),
+    TR("FastGS"));
+
+SS_MSG(preset_fastgs_help,
+    EN("FastGS preset with multi-view consistent densification, snug "
+       "bounding boxes, and floater pruning."),
+    JA("マルチビュー誤差整合性ゲーティング、コンパクトなタイル境界ボックス、"
+       "フローター除去を備えた FastGS プリセット。"),
+    ZH_HANS("具有多视角误差一致性门控、紧凑图元包围盒与漂浮物剪枝的 FastGS "
+            "预设。"),
+    ZH_HANT("具有多視角誤差一致性門控、緊湊圖元包圍盒與漂浮物剪枝的 FastGS "
+            "預設。"),
+    KO("다중 시점 오차 일관성 게이팅, 컴팩트 바운딩 박스, 부유물 가지치기가 "
+       "적용된 FastGS 프리셋입니다."),
+    DE("FastGS-Voreinstellung mit konsistenter Mehransichten-Verdichtung, "
+       "engeren Bounding-Boxen und Floater-Bereinigung."),
+    FR("Préréglage FastGS avec densification cohérente multi-vues, boîtes "
+       "englobantes ajustées et élagage des flotteurs."),
+    ES("Preajuste FastGS con densificación consistente multivista, cajas "
+       "delimitadoras ajustadas y poda de flotadores."),
+    PT("Predefinição FastGS com densificação consistente multivista, caixas "
+       "delimitadoras ajustadas e poda de flutuadores."),
+    IT("Preimpostazione FastGS con densificazione coerente multi-vista, "
+       "riquadri di delimitazione aderenti e potatura dei floaters."),
+    NL("FastGS-voorinstelling met multiview-consistente verdichting, strakke "
+       "selectiekaders en floater-snoei."),
+    RU("Пресет FastGS с многоракурсной согласованной плотностью, компактными "
+       "ограничивающими рамками и удалением артефактов."),
+    TR("Çoklu görünüm tutarlı yoğunlaştırma, sıkı sınırlayıcı kutular ve "
+       "uçuşan parça budama özelliklerine sahip FastGS hazır ayarı."));
+
 // ---------------------------------------------------------------------------
 // name -> text. The names are config/TrainConfig.h's kTrainPresets, and each
 // consumer static_asserts that the two lists are the same length.
@@ -390,6 +433,7 @@ inline constexpr PresetText kPresetText[] = {
     {"hdr",               &preset_hdr,               &preset_hdr_help},
     {"synthetic",         &preset_synthetic,         &preset_synthetic_help},
     {"meshing",           &preset_meshing,           &preset_meshing_help},
+    {"fastgs",            &preset_fastgs,            &preset_fastgs_help},
     // hidden by default, uncomment to enable
    //  {"academic-baseline", &preset_academic_baseline, &preset_academic_baseline_help},
 };

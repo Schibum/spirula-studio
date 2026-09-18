@@ -192,6 +192,14 @@ inline int train_tier_rank(const char* tier) {
     X(float, max_screen_size_clip_hardness, 1.5f, "detail", "basic", "")     \
     X(float, max_screen_size_penalty, 1.0f, "detail", "basic", "")           \
     X(float, max_world_size, kTrainInf, "detail", "expert", "")              \
+    /* ==== fastgs -- FastGS multi-view consistency and acceleration ==== */ \
+    X(bool, fastgs_densify, false, "detail", "advanced", "")                  \
+    X(int, fastgs_min_views, 5, "detail", "advanced", "")                     \
+    X(bool, fastgs_prune, false, "detail", "advanced", "")                    \
+    X(int, fastgs_prune_start_iter, 15000, "detail", "advanced", "")          \
+    X(int, fastgs_prune_interval, 3000, "detail", "advanced", "")             \
+    X(float, fastgs_prune_score_threshold, 0.9f, "detail", "advanced", "")   \
+    X(float, fastgs_mult, 1.0f, "detail", "advanced", "")                     \
                                                                              \
     /* ==== loss -- how the render is compared against the photo ==== */     \
     X(float, ssim_lambda, 0.2f, "loss", "basic", "")                         \
@@ -379,6 +387,7 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
     {"in-the-wild"},
     {"centered-object"},
     {"hdr"},
+    {"fastgs"},
     {"synthetic"},
     {"meshing"},
     // {"academic-baseline"},  // hidden by default, uncomment to enable
@@ -387,6 +396,20 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
 // Returns false for an unknown preset name.
 inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
     if (name == "3dgs") {
+        return true;
+    }
+    if (name == "fastgs") {
+        c.fastgs_densify = true;
+        c.fastgs_min_views = 5;
+        c.fastgs_prune = true;
+        c.fastgs_prune_start_iter = 15000;
+        c.fastgs_prune_interval = 3000;
+        c.fastgs_prune_score_threshold = 0.9f;
+        c.fastgs_mult = 0.6f;
+        c.refine_stop_iter = 15000;
+        c.refine_every = 500;
+        c.features_dc_lr = 0.005f;
+        c.use_revised_densification = true;
         return true;
     }
     if (name == "360-camera") {

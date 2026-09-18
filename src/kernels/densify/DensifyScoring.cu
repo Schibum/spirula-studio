@@ -327,13 +327,17 @@ __global__ void densify_clip_score_kernel(
     float power,
     float2* __restrict__ accum_buffer,
     const float* __restrict__ cutoff,  // [1], null to skip
-    float2* __restrict__ score_out     // [N], null to skip
+    float2* __restrict__ score_out,    // [N], null to skip
+    int min_views
 ) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_splats)
         return;
     float2 a = accum_buffer[idx];
     float v = a.x;
+    if (min_views > 0 && (int)a.y < min_views) {
+        v = 0.0f;
+    }
     if (cutoff != nullptr) {
         float c = cutoff[0];
         // !(v <= c) also catches NaN, which would otherwise survive every ranking.
@@ -343,7 +347,7 @@ __global__ void densify_clip_score_kernel(
         }
     }
     if (score_out != nullptr) {
-        if (power != 1.0f)
+        if (power != 1.0f && v > 0.0f)
             v = powf(fmaxf(v, 0.0f), power);
         score_out[idx] = make_float2(v, a.y);
     }
@@ -355,7 +359,8 @@ void densify_clip_score_tensor(
     DeviceVector<float2> accum_buffer,  // [N, 2]; only .x is clipped
     float quantile,
     float power,
-    DeviceVector<float2> score_out  // [N, 2], optional: clipped .x ^ power
+    DeviceVector<float2> score_out,  // [N, 2], optional: clipped .x ^ power
+    int min_views = 0
 ) {
     if (num_splats <= 0 || accum_buffer.data_ptr() == nullptr)
         return;
@@ -379,7 +384,7 @@ void densify_clip_score_tensor(
             /*abs_input=*/false, cutoff);
     }
     densify_clip_score_kernel<<<_LAUNCH_ARGS_1D(num_splats, 256)>>>(
-        (long)num_splats, power, accum_buffer.data_ptr(), cutoff, out);
+        (long)num_splats, power, accum_buffer.data_ptr(), cutoff, out, min_views);
     CHECK_DEVICE_ERROR(cudaGetLastError());
 }
 

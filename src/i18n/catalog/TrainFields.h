@@ -4897,6 +4897,32 @@ SS_MSG(max_world_size_help,
     TR("Dünya biriminde bundan büyük splat'ları küçültür. Geniş iç mekânlarda "
        "uzakta devasa uçuşan artıklar belirdiğinde ayarlayın."));
 
+// FastGS
+SS_MSG_EN(fastgs_densify, "FastGS multi-view densification");
+SS_MSG_EN(fastgs_densify_help,
+    "Enable FastGS multi-view consistent densification gating. Splats are only "
+    "split or cloned if they consistently cover errors across multiple viewpoints.");
+SS_MSG_EN(fastgs_min_views, "FastGS minimum views");
+SS_MSG_EN(fastgs_min_views_help,
+    "Minimum number of distinct camera view observations required for a splat "
+    "to qualify for densification splitting or cloning.");
+SS_MSG_EN(fastgs_prune, "FastGS targeted floater pruning");
+SS_MSG_EN(fastgs_prune_help,
+    "Enable targeted floater pruning from FastGS to purge persistent high-error "
+    "unresolvable splats and low-opacity artifacts in late training.");
+SS_MSG_EN(fastgs_prune_start_iter, "FastGS prune start iteration");
+SS_MSG_EN(fastgs_prune_start_iter_help,
+    "Training step at which targeted floater pruning starts (default 15000).");
+SS_MSG_EN(fastgs_prune_interval, "FastGS prune interval");
+SS_MSG_EN(fastgs_prune_interval_help,
+    "Step interval between targeted floater pruning passes (default 3000).");
+SS_MSG_EN(fastgs_prune_score_threshold, "FastGS prune score threshold");
+SS_MSG_EN(fastgs_prune_score_threshold_help,
+    "Error threshold above which low-opacity splats are identified as floaters and pruned/relocated.");
+SS_MSG_EN(fastgs_mult, "FastGS compact box multiplier");
+SS_MSG_EN(fastgs_mult_help,
+    "Multiplier on the ellipse tile bounding box. Lower values (e.g. 0.6) shrink the tile footprint for faster rasterization.");
+
 
 // ===========================================================================
 // Image Loss

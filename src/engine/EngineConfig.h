@@ -238,6 +238,14 @@ struct DensifyConfig {
     float las_split_opacity_k_init      = 0.5f;
     float las_split_opacity_k_final     = 0.6f;
     int   las_split_opacity_k_warmup    = 4500;
+
+    // FastGS multi-view consistency and floater pruning
+    bool  fastgs_densify                = false;
+    int   fastgs_min_views              = 0;
+    bool  fastgs_prune                  = false;
+    bool  fastgs_prune_active           = false;
+    float fastgs_prune_score_threshold  = 0.9f;
+    float fastgs_mult                   = 1.0f;
 };
 
 

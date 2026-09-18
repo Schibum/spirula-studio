@@ -26,6 +26,7 @@
 #undef CudaDeviceExport
 #include "optim_quant.slang"
 #include "sh_addr.slang"
+#include "int64_compat.slang"
 
 [ForceInline]
 float _dn_hash14(float4 p4) {
@@ -444,7 +445,7 @@ void densify_efraimidis_keys(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 // arbitrary; parity tests compare relocated rows as a multiset.
 // ---------------------------------------------------------------------------
 
-struct RelocMaskParams {  // 80 bytes: pushed directly
+struct RelocMaskParams {  // 96 bytes: pushed directly
     float* means;        // [N, 3]
     float* quats;        // [N, 4]
     float* scales;       // [N, 3]
@@ -453,9 +454,12 @@ struct RelocMaskParams {  // 80 bytes: pushed directly
     int* mask;           // [N] out: 1 = keep (samplable), 0 = relocated
     int* count;          // [1] out: number of relocated splats
     int* dst_indices;    // [N] out: compacted relocated indices
+    float* accum_buffer; // [N, 2] in: (score, count)
     float min_opacity;
+    float prune_score_thresh;
     uint num_splats;
     uint wgs_per_row;
+    uint prune_active;
     uint _pad0;
 };
 
@@ -479,7 +483,15 @@ void densify_reloc_mask(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     bool is_low_opac = _dn_sigmoid(opac) <= p.min_opacity;
     bool is_finite = _dn_finitef(dot(mean, mean) / dot(quat, quat) +
                                  dot(scale, dc) * opac);
-    bool relocate = is_low_opac || !is_finite || splat_scale_is_dead(scale);
+    bool is_floater = false;
+    if (p.prune_active != 0 && !is_null(p.accum_buffer)) {
+        float acc_score = p.accum_buffer[2 * idx];
+        float acc_views = p.accum_buffer[2 * idx + 1];
+        if (acc_score >= p.prune_score_thresh && _dn_sigmoid(opac) < 0.1f && acc_views >= 2.0f) {
+            is_floater = true;
+        }
+    }
+    bool relocate = is_low_opac || !is_finite || splat_scale_is_dead(scale) || is_floater;
 
     p.mask[idx] = relocate ? 0 : 1;
 
@@ -1225,7 +1237,7 @@ struct ScoreClipParams {  // 48 bytes: pushed directly
     float2* score_out;  // [N] (use_out gates)
     float power;
     uint use_cutoff, use_out, num_splats, wgs_per_row;
-    uint _pad0;
+    uint min_views;
 };
 
 // The clip is in place and idempotent; the power is not, so it lands in
@@ -1238,6 +1250,9 @@ void densify_clip_score(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     if (idx >= p.num_splats) return;
     float2 a = p.accum_buffer[idx];
     float v = a.x;
+    if (p.min_views > 0 && uint(a.y) < p.min_views) {
+        v = 0.0f;
+    }
     if (p.use_cutoff != 0) {
         float c = p.cutoff[0];
         // !(v <= c) also catches NaN, which would otherwise survive every ranking.
@@ -1247,7 +1262,7 @@ void densify_clip_score(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         }
     }
     if (p.use_out != 0) {
-        if (p.power != 1.0f) v = pow(max(v, 0.0f), p.power);
+        if (p.power != 1.0f && v > 0.0f) v = pow(max(v, 0.0f), p.power);
         p.score_out[idx] = float2(v, a.y);
     }
 }

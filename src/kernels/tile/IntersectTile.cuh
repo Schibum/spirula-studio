@@ -21,6 +21,7 @@ struct ProjEllipseView {
     int32_t xy = -1;     // -1: ellipse center is the AABB center (3DGUT)
     int32_t conic = 0;
     int32_t opac = 0;
+    float mult = 1.0f;
 };
 
 // The two screen layouts as ellipse views. 3DGUT keeps its projected conic in
