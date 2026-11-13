@@ -1076,6 +1076,17 @@ private:
     std::shared_ptr<TrainStep>    _last_train_step_held;
     std::shared_ptr<DecodedBatch> _last_val_held;
 
+    // SS_RECYCLE_BATCHES=1: steps the trainer is done with, whose pixel
+    // buffers the next staged steps take over. A fresh step is ~150 MB of
+    // mmap'd vectors at 2880^2 x 2 images, page-faulted in and unmapped again.
+    const bool _recycle_batches = [] {
+        const char* v = spirula::env("RECYCLE_BATCHES");
+        return v && *v && v[0] != '0';
+    }();
+    std::mutex                             _retired_mu;
+    std::deque<std::shared_ptr<TrainStep>> _retired;
+    std::shared_ptr<DecodedBatch> recycled_batch();
+
     // Decrement a job's shared step/batch counter and, when it reaches zero,
     // build the views and publish to the appropriate ready queue.
     void publish_if_done(DecodeJob& job);
@@ -2554,7 +2565,7 @@ void DataManagerImpl::enqueue_step(
     // Allocate every sub-batch shell up front so stepp->subs is complete
     // before any job runs.
     for (size_t i = 0; i < spec.size(); ++i) {
-        stepp->subs[i] = std::make_shared<DecodedBatch>();
+        stepp->subs[i] = recycled_batch();
         allocate_batch(*stepp->subs[i], _train_groups[spec[i].group], spec[i].picks, spec[i].divisor);
     }
 
@@ -2621,9 +2632,28 @@ const TrainStep& DataManagerImpl::next_train_step() {
         if (r == BoundedQueue<std::shared_ptr<TrainStep>>::Pop::Closed)
             throw std::runtime_error("DataManager: train prefetch queue closed");
     }
+    if (_recycle_batches && _last_train_step_held) {
+        std::lock_guard<std::mutex> lk(_retired_mu);
+        _retired.push_back(std::move(_last_train_step_held));
+        if (_retired.size() > 3) _retired.pop_front();
+    }
     _last_train_step_held = s;
     if (!s->subs.empty()) _last_train_divisor = s->subs[0]->resolution_divisor;
     return *_last_train_step_held;
+}
+
+std::shared_ptr<DecodedBatch> DataManagerImpl::recycled_batch() {
+    std::lock_guard<std::mutex> lk(_retired_mu);
+    for (auto& step : _retired) {
+        // A decode worker's last job can still name the step it finished.
+        if (step.use_count() != 1) continue;
+        while (!step->subs.empty()) {
+            std::shared_ptr<DecodedBatch> b = std::move(step->subs.back());
+            step->subs.pop_back();
+            if (b.use_count() == 1) return b;
+        }
+    }
+    return std::make_shared<DecodedBatch>();
 }
 
 const DecodedBatch& DataManagerImpl::next_train_batch() {
