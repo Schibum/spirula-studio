@@ -38,7 +38,8 @@ bool resolve_pointer(const void* p, Allocation* alloc, VkDeviceSize* offset,
 // queue timeline (Context::submit).
 struct StreamImpl {
     VkCommandPool pool = VK_NULL_HANDLE;
-    static constexpr int kRing = 4;
+    static constexpr int kRing = 16;
+    int ring = 4;  // entries in use; kRing under SS_VK_ASYNC_UPLOAD
     VkCommandBuffer cbs[kRing] = {};
     uint64_t cb_submitted[kRing] = {};  // timeline value of each ring entry
     int cur = 0;
