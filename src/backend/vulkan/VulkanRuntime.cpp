@@ -175,6 +175,17 @@ void destroy_allocation(const Allocation& a) {
 // streams
 // ---------------------------------------------------------------------------
 
+// SS_VK_ASYNC_UPLOAD=1: memcpy_sync from pageable host memory returns once
+// the bytes are in the staging ring, like memset_sync. A warped step makes
+// ~13 such uploads a pass, each otherwise draining the queue twice.
+bool async_upload() {
+    static const bool on = [] {
+        const char* v = spirula::env("VK_ASYNC_UPLOAD");
+        return v && *v && v[0] != '0';
+    }();
+    return on;
+}
+
 std::mutex g_stream_mutex;
 std::vector<StreamImpl*> g_streams;  // all live stream contexts
 StreamImpl* g_default_stream = nullptr;
@@ -197,7 +208,9 @@ StreamImpl* create_stream_impl() {
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cai.commandPool = s->pool;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = StreamImpl::kRing;
+    // Each staged upload is a submission; a ring of 4 blocks on the 4th.
+    if (async_upload()) s->ring = StreamImpl::kRing;
+    cai.commandBufferCount = (uint32_t)s->ring;
     r = vkAllocateCommandBuffers(ctx.device(), &cai, s->cbs);
     if (r != VK_SUCCESS) {
         set_error("vkAllocateCommandBuffers failed", r);
@@ -269,7 +282,7 @@ VkCommandBuffer stream_begin(StreamImpl* s) {
     Context& ctx = Context::get();
     if (s->recording) return s->cbs[s->cur];
     // Reuse the next ring entry once its previous submission completed.
-    int next = (s->cur + 1) % StreamImpl::kRing;
+    int next = (s->cur + 1) % s->ring;
     if (!ctx.wait(s->cb_submitted[next])) return VK_NULL_HANDLE;
     s->cur = next;
     VkCommandBuffer cb = s->cbs[s->cur];
@@ -651,6 +664,14 @@ void memcpy_sync(void* dst, const void* src, size_t bytes, MemcpyKind kind) {
         return;
     if (src_dev && !range_ok(s, bytes, "memcpy_sync: src range overflow"))
         return;
+
+    if (dst_dev && !src_dev && !s.known && vk::async_upload()) {
+        // Submission order is the ordering cudaMemcpy promises; the source is
+        // copied out before this returns, so the caller may reuse it.
+        vk::flush_all_streams();
+        memcpy_async(dst, src, bytes, MemcpyKind::HostToDevice, kDefaultStream);
+        return;
+    }
 
     // Profiling: attribute the pending-work drain to DEVSYNC so the copy
     // scope below measures pure transfer (the wait() a few lines down is then
