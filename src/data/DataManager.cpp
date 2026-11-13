@@ -2212,7 +2212,21 @@ const TrainStep& DataManagerImpl::next_step_cpu() {
 // ===========================================================================
 // DISK mode pipeline
 // ===========================================================================
+// SS_<name> as a positive integer, else `fallback`.
+static int env_int_or(const char* name, int fallback) {
+    const char* v = spirula::env(name);
+    const int n = v ? std::atoi(v) : 0;
+    return n > 0 ? n : fallback;
+}
+
 void DataManagerImpl::start_disk_pipeline() {
+    // SS_PREFETCH_BATCHES / SS_DECODE_WORKERS: the decode pipeline's depth and
+    // width, for a host with cores to spare while the GPU waits on images.
+    _cfg.prefetch_batches = env_int_or("PREFETCH_BATCHES", _cfg.prefetch_batches);
+    if (const int w = env_int_or("DECODE_WORKERS", 0)) {
+        _cfg.workers_rgb = w;
+        _cfg.workers_depth = _cfg.workers_normal = std::max(1, w / 2);
+    }
     int prefetch = std::max(1, _cfg.prefetch_batches);
     // Job queues are sized generously — each batch enqueues B jobs per
     // modality so cap = prefetch * batch_size keeps the scheduler from
