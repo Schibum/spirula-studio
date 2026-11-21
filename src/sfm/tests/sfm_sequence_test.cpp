@@ -618,6 +618,253 @@ static void testTieMerge(int device) {
     printf("tie-merge: the walk with N=3 keep: %u/%zu cameras in %zu model(s), shape error %.3f\n",
            reg, w.gt.size(), on.size(), err);
 }
+
+// SS_SFM_TIE_SPAN_IMAGES / _MAXSPAN_IMAGES / _CLASH. The tie scene with a revisit: cameras
+// 20-29 see a repeat of the wall 40 further on (as 0-9 see the wall, 0.3 to the side), so
+// verified matches tie distinct places; the block 10-19 at x2 as before; each side its own
+// copy of every point it sees twice. Sequence positions 0-9, 20-29 (block) and 320-329
+// (revisit), so the block's ties are matches at most 29 positions apart, the revisit's at
+// least 291. For the first ND points camera 10 has a second keypoint `off` px away, which the
+// pre side's copy holds:
+// fusing that copy with the block's holds camera 10 twice (a clash).
+struct SpanScene {
+    Walk w;
+    std::vector<Vec3> X;
+    std::vector<uint8_t> dupB, dupR;   // seen twice or more on the pre side and the block / revisit
+    std::vector<uint32_t> clash_p;     // points with camera 10's second keypoint
+    SequenceTable seqs;
+};
+
+static constexpr uint32_t kSpanNP = 500, kSpanND = 30, kSpanM = 30;
+static constexpr double kSpanD = 40.0;
+
+static SpanScene makeSpanScene(float off) {
+    SpanScene s;
+    Walk& w = s.w;
+    const uint32_t NP = kSpanNP, ND = kSpanND, M = kSpanM, NF = NP + ND;
+    Camera K = Camera::defaultFor(1, w.W, w.H, w.focal);
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<double> ux(4.0, 8.0), uy(-3.5, 3.5), uz(-2.0, 11.5);
+    std::normal_distribution<double> noise(0.0, 0.3);
+    s.X.resize(NP);
+    for (Vec3& p : s.X) p = {ux(rng), uy(rng), uz(rng)};
+    for (uint32_t c = 0; c < M; c++)
+        w.gt.push_back(lookAtX({c >= 20 ? 0.3 : 0.0, 0, 0.5 * (c % 20) + (c >= 20 ? kSpanD : 0)}));
+    w.feats.resize(M);
+    w.names.resize(M);
+    std::vector<std::vector<char>> vis(M, std::vector<char>(NF, 0));
+    for (uint32_t c = 0; c < M; c++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "%03u", c);
+        w.names[c] = nm;
+        FeatureSet& fs = w.feats[c];
+        fs.width = w.W;
+        fs.height = w.H;
+        fs.keypoints.assign(NF, {-1000, -1000, 2, 0, 0});
+        for (uint32_t p = 0; p < NP; p++) {
+            Vec3 pc = mul(w.gt[c].R, s.X[p] + Vec3{0, 0, c >= 20 ? kSpanD : 0}) + w.gt[c].t;
+            Vec2 px = K.project(pc);
+            if (pc.z > 0.1 && px.x > 5 && px.x < w.W - 5 && px.y > 0 && px.y < w.H) {
+                fs.keypoints[p] = {(float)(px.x + noise(rng)), (float)(px.y + noise(rng)), 2, 0, 0};
+                vis[c][p] = 1;
+            }
+        }
+    }
+    w.db.images.resize(M);
+    for (uint32_t c = 0; c < M; c++) w.db.images[c] = {w.names[c], NF};
+    for (uint32_t i = 0; i < M; i++)
+        for (uint32_t j = i + 1; j < M; j++) {
+            TwoViewMatches tv;
+            tv.image1 = i;
+            tv.image2 = j;
+            tv.config = (int)TwoViewConfig::Uncalibrated;
+            for (uint32_t p = 0; p < NP; p++)
+                if (vis[i][p] && vis[j][p]) tv.matches.push_back({p, p});
+            if (tv.matches.size() >= 15) w.db.pairs.push_back(std::move(tv));
+        }
+    s.dupB.assign(NP, 0);
+    s.dupR.assign(NP, 0);
+    for (uint32_t p = 0; p < NP; p++) {
+        int pre = 0, blk = 0, rev = 0;
+        for (uint32_t c = 0; c < M; c++) (c < 10 ? pre : c < 20 ? blk : rev) += vis[c][p];
+        s.dupB[p] = pre >= 2 && blk >= 2;
+        s.dupR[p] = pre >= 2 && rev >= 2;
+        if (s.dupB[p] && vis[10][p] && s.clash_p.size() < ND) {
+            const uint32_t f = NP + (uint32_t)s.clash_p.size();
+            w.feats[10].keypoints[f] = w.feats[10].keypoints[p];
+            w.feats[10].keypoints[f].x += off;
+            s.clash_p.push_back(p);
+        }
+    }
+    s.seqs.seq.assign(M, 0);
+    s.seqs.member.assign(M, 0);
+    s.seqs.pos.resize(M);
+    for (uint32_t c = 0; c < M; c++) s.seqs.pos[c] = c < 10 ? c : c < 20 ? c + 10 : c + 300;
+    s.seqs.length = {330};
+    s.seqs.members = {{""}};
+    return s;
+}
+
+// The true poses, the block scaled about camera 10, each side's copies; the pre side's
+// clash points also hold camera 10's second keypoint.
+static Reconstruction splitSpanModel(const SpanScene& s, const Reconstruction& base) {
+    const Walk& w = s.w;
+    Reconstruction m = base;
+    const Vec3 pivot = cameraCenter(w.gt[10]);
+    for (auto& kv : m.cameras) {
+        Camera K = Camera::defaultFor(1, w.W, w.H, w.focal);
+        K.id = kv.first;
+        kv.second = K;
+    }
+    for (auto& kv : m.images) {
+        Pose p = w.gt[kv.first];
+        if (kv.first >= 10 && kv.first < 20) {
+            const Vec3 c = pivot + (cameraCenter(p) - pivot) * 2.0;
+            const Vec3 t = mul(p.R, c);
+            p.t = {-t.x, -t.y, -t.z};
+        }
+        kv.second.pose = p;
+        std::fill(kv.second.point3D_ids.begin(), kv.second.point3D_ids.end(), kInvalidPoint3D);
+    }
+    m.points3D.clear();
+    m.next_point3D_id = 1;
+    for (uint32_t p = 0; p < kSpanNP; p++)
+        for (uint32_t side = 0; side < 3; side++) {
+            std::vector<TrackElement> tr;
+            for (uint32_t c = side * 10; c < side * 10 + 10; c++)
+                if (w.feats[c].keypoints[p].x >= 0) tr.push_back({c, p});
+            if (tr.size() < 2) continue;
+            if (side == 0)
+                for (uint32_t k = 0; k < s.clash_p.size(); k++)
+                    if (s.clash_p[k] == p) tr.push_back({10, kSpanNP + k});
+            m.addPoint3D(side == 1   ? pivot + (s.X[p] - pivot) * 2.0
+                         : side == 2 ? s.X[p] + Vec3{0, 0, kSpanD}
+                                     : s.X[p],
+                         tr);
+        }
+    return m;
+}
+
+// Points of `mask` whose pre-side copy shares an id with a copy in cameras [lo, lo + 10).
+static size_t spanJoined(const SpanScene& s, const Reconstruction& m,
+                         const std::vector<uint8_t>& mask, uint32_t lo) {
+    auto idOf = [&](uint32_t c, uint32_t p) {
+        auto it = m.images.find(c);
+        return it == m.images.end() || !it->second.registered ? kInvalidPoint3D
+                                                               : it->second.point3D_ids[p];
+    };
+    size_t n = 0;
+    for (uint32_t p = 0; p < kSpanNP; p++) {
+        if (!mask[p]) continue;
+        std::vector<uint64_t> pre;
+        for (uint32_t c = 0; c < 10; c++)
+            if (idOf(c, p) != kInvalidPoint3D) pre.push_back(idOf(c, p));
+        bool joined = false;
+        for (uint32_t c = lo; c < lo + 10 && !joined; c++)
+            joined = idOf(c, p) != kInvalidPoint3D &&
+                     std::find(pre.begin(), pre.end(), idOf(c, p)) != pre.end();
+        n += joined;
+    }
+    return n;
+}
+
+static void setSpanEnv(const char* n, const char* span, const char* maxspan, const char* clash) {
+    const char* names[] = {"SS_SFM_TIE_MERGE", "SS_SFM_TIE_SPAN_IMAGES",
+                           "SS_SFM_TIE_MAXSPAN_IMAGES", "SS_SFM_TIE_CLASH"};
+    const char* vals[] = {n, span, maxspan, clash};
+    for (int i = 0; i < 4; i++) {
+        if (vals[i]) setenv(names[i], vals[i], 1);
+        else unsetenv(names[i]);
+    }
+}
+
+// The span scene's model under each knob set: `off` px between camera 10's two keypoints.
+static void testTieSpan(int device, float off) {
+    SpanScene s = makeSpanScene(off);
+    MapperOptions opt;
+    opt.focal = s.w.focal;
+    opt.device = device;
+    setSpanEnv(nullptr, nullptr, nullptr, nullptr);
+    setTieEnv(nullptr, nullptr, nullptr);
+    std::vector<Reconstruction> base;
+    {
+        Mapper m(s.w.db, s.w.feats, opt);
+        base = m.run();
+    }
+    check(!base.empty() && base[0].numRegistered() == kSpanM, "span scene: the clean scene registers");
+    if (base.empty() || base[0].numRegistered() != kSpanM) return;
+    const Reconstruction split = splitSpanModel(s, base[0]);
+    std::vector<uint8_t> clash(kSpanNP, 0), plainB = s.dupB;
+    for (uint32_t p : s.clash_p) clash[p] = 1, plainB[p] = 0;
+    size_t nB = 0, nR = 0;
+    for (uint32_t p = 0; p < kSpanNP; p++) nB += plainB[p], nR += s.dupR[p];
+
+    auto run = [&](const char* n, const char* span, const char* maxspan, const char* cl) {
+        setSpanEnv(n, span, maxspan, cl);
+        Reconstruction out;
+        {
+            Mapper m(s.w.db, s.w.feats, opt, {}, nullptr, &s.seqs);
+            out = m.refine(split);
+        }
+        setSpanEnv(nullptr, nullptr, nullptr, nullptr);
+        return out;
+    };
+    const Reconstruction off_m = run(nullptr, nullptr, nullptr, nullptr);
+    const Reconstruction on = run("3", nullptr, nullptr, nullptr);
+    const Reconstruction span0 = run("3", "0", "0", "refuse");
+    const Reconstruction wide = run("3", "1000", "1000", nullptr);
+    const Reconstruction span = run("3", "60", nullptr, nullptr);
+    const Reconstruction maxspan = run("3", nullptr, "60", nullptr);
+    const Reconstruction resolve = run("3", "60", nullptr, "resolve");
+    struct Row { const char* name; const Reconstruction* m; } rows[] = {
+        {"split", &split}, {"off", &off_m}, {"N=3", &on}, {"N=3 span 1000", &wide},
+        {"N=3 span 60", &span}, {"N=3 maxspan 60", &maxspan}, {"N=3 span 60 resolve", &resolve}};
+    for (const Row& r : rows)
+        printf("tie-span: %.0f px %-20s block/pre %.3f, block %zu/%zu, revisit %zu/%zu, clash %zu/%zu "
+               "copies one point, %zu points\n", off, r.name, blockRatio(*r.m), spanJoined(s, *r.m, plainB, 10),
+               nB, spanJoined(s, *r.m, s.dupR, 20), nR, spanJoined(s, *r.m, clash, 10),
+               s.clash_p.size(), r.m->points3D.size());
+    check(s.clash_p.size() == kSpanND, "span scene: every clash point placed");
+    size_t true_kp = 0;
+    for (uint32_t k = 0; k < kSpanND; k++) {
+        const Image& im = resolve.images.at(10);
+        true_kp += im.point3D_ids[s.clash_p[k]] != kInvalidPoint3D &&
+                   im.point3D_ids[kSpanNP + k] == kInvalidPoint3D;
+    }
+    printf("tie-span: %.0f px: resolve keeps camera 10's true keypoint for %zu/%u clash points\n",
+           off, true_kp, kSpanND);
+    if (off < 5) {
+        // 2 px: both keypoints are inliers, so refusing keeps the clash points apart for good.
+        check(spanJoined(s, span, clash, 10) <= 2, "refuse: the clash points stay two points");
+        check(spanJoined(s, resolve, clash, 10) >= kSpanND / 2,
+              "resolve: half the clash points or more fused");
+        return;
+    }
+    check(sameModel(on, span0) && on.points3D.size() == span0.points3D.size(),
+          "SPAN 0, MAXSPAN 0, CLASH=refuse are off");
+    check(sameModel(on, wide) && on.points3D.size() == wide.points3D.size(),
+          "a span every match is within changes nothing");
+    check(blockRatio(off_m) > 1.9 && spanJoined(s, off_m, s.dupR, 20) <= nR / 50,
+          "off: the block x2, the revisit's copies apart");
+    check(spanJoined(s, on, s.dupR, 20) >= nR / 4, "N=3: the revisit's copies fused (wrong joins)");
+    check(std::fabs(blockRatio(span) - 1.0) < 0.03 && spanJoined(s, span, plainB, 10) >= 0.9 * nB &&
+              spanJoined(s, span, s.dupR, 20) <= nR / 50,
+          "span 60: the block's copies fused, the revisit's (291+ apart) not");
+    check(std::fabs(blockRatio(maxspan) - 1.0) < 0.03 && spanJoined(s, maxspan, s.dupR, 20) <= nR / 50,
+          "maxspan 60: no union reaches the revisit");
+    check(spanJoined(s, resolve, clash, 10) >= kSpanND * 8 / 10 && true_kp >= kSpanND * 8 / 10,
+          "resolve (10 px): the clash points fused on camera 10's true keypoint");
+    check(std::fabs(blockRatio(resolve) - 1.0) < 0.03, "resolve: the block one scale");
+    bool threw = false;
+    setSpanEnv("3", nullptr, nullptr, "maybe");
+    try {
+        Mapper m(s.w.db, s.w.feats, opt);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    setSpanEnv(nullptr, nullptr, nullptr, nullptr);
+    check(threw, "an invalid SS_SFM_TIE_CLASH is refused");
+}
 #endif
 
 static int cmdSequenceTest(int argc, char** argv) {
@@ -634,6 +881,8 @@ static int cmdSequenceTest(int argc, char** argv) {
 #ifndef _WIN32
     if (gpu) testTrace(device);
     if (gpu) testTieMerge(device);
+    if (gpu) testTieSpan(device, 10);
+    if (gpu) testTieSpan(device, 2);
 #endif
     printf("%s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;

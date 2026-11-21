@@ -5722,10 +5722,88 @@ private:
     // SS_SFM_TIE_NEAR=D: only points nearer than D baselines to one of their cameras.
     // SS_SFM_TIE_KEEP=0 drops a fused point's observations over the error limit before
     // the BA; 1 (default) leaves them to the robust loss and the filter after it.
+    // SS_SFM_TIE_SPAN_IMAGES=K: only matches between images at most K sequence positions
+    // apart (no sequence: ids) count towards N, so a revisit's matches tie nothing.
+    // SS_SFM_TIE_MAXSPAN_IMAGES=M: no union whose observations lie more than M apart.
+    // SS_SFM_TIE_CLASH=resolve: a union holding an image twice keeps, per such image, the
+    // observation nearer the union's point (re-triangulated without them), if each part
+    // keeps 70 % of its observations; refuse (default) refuses every such union.
     struct TieStats {
         size_t linked = 0, candidates = 0, merged = 0, joined = 0, clash = 0, cap = 0, distant = 0;
         size_t kept_obs = 0, dropped_obs = 0, points_before = 0, points_after = 0;
+        size_t refused_span = 0, refused_maxspan = 0, resolved_clash = 0, clash_dropped = 0;
     };
+
+    // Sequence positions apart (no sequences: ids apart); INT_MAX across sequences.
+    int tieGap(uint32_t a, uint32_t b) const {
+        if (seq_) return seq_->distance(a, b);
+        return a > b ? (int)(a - b) : (int)(b - a);
+    }
+
+    // The widest gap between two observations of one sequence in x + y.
+    int tieTrackSpan(const std::vector<TrackElement>& x, const std::vector<TrackElement>& y) const {
+        int s = 0;
+        for (const auto* t1 : {&x, &y})
+            for (const TrackElement& e : *t1)
+                for (const auto* t2 : {&x, &y})
+                    for (const TrackElement& f : *t2) {
+                        const int g = tieGap(e.image_id, f.image_id);
+                        if (g != INT_MAX && g > s) s = g;
+                    }
+        return s;
+    }
+
+    static int tieClashMode() {
+        const char* v = spirula::env("SFM_TIE_CLASH");
+        if (!v || std::string(v) == "refuse") return 0;
+        if (std::string(v) == "resolve") return 1;
+        throw std::invalid_argument("invalid SS_SFM_TIE_CLASH (refuse | resolve)");
+    }
+
+    PointObservation tieObs(const ModelIndex& mi, const TrackElement& e) const {
+        return {poseToP(mi.img[e.image_id]->pose),
+                mi.cam[e.image_id]->bearing(kp(e.image_id, e.point2D_idx)),
+                mi.cam[e.image_id]->errRad(opt_.max_reproj_error)};
+    }
+
+    // SS_SFM_TIE_CLASH=resolve for A + B, `both` the (A index, B index) pairs of one image:
+    // drops the farther observation of each from its track and the image's point id.
+    bool tieResolve(Point3D& A, Point3D& B, const std::vector<std::pair<size_t, size_t>>& both,
+                    ModelIndex& mi) {
+        std::vector<uint8_t> inA(A.track.size(), 0), inB(B.track.size(), 0);
+        for (const auto& pr : both) inA[pr.first] = inB[pr.second] = 1;
+        std::vector<PointObservation> obs;
+        for (size_t k = 0; k < A.track.size(); k++) if (!inA[k]) obs.push_back(tieObs(mi, A.track[k]));
+        for (size_t k = 0; k < B.track.size(); k++) if (!inB[k]) obs.push_back(tieObs(mi, B.track[k]));
+        if (obs.size() < 2) return false;
+        Vec3 x = A.xyz;
+        double best = std::numeric_limits<double>::infinity();
+        for (const Vec3& s : {A.xyz, B.xyz}) {
+            const Vec3 y = refineTriangulatedPoint(s, obs, 20);
+            const double c = pointAngularCost(y, obs);
+            if (c < best) { best = c; x = y; }
+        }
+        std::vector<uint8_t> dropA(A.track.size(), 0), dropB(B.track.size(), 0);
+        size_t na = 0, nb = 0;
+        for (const auto& [ia, ib] : both) {
+            const TrackElement &ea = A.track[ia], &eb = B.track[ib];
+            const bool keep_a = reprojErrAt(mi, ea.image_id, ea.point2D_idx, x) <=
+                                reprojErrAt(mi, eb.image_id, eb.point2D_idx, x);
+            (keep_a ? dropB[ib] : dropA[ia]) = 1;
+            (keep_a ? nb : na)++;
+        }
+        if (10 * na > 3 * A.track.size() || 10 * nb > 3 * B.track.size()) return false;
+        for (auto [P, drop] : {std::pair{&A, &dropA}, std::pair{&B, &dropB}}) {
+            size_t keep = 0;
+            for (size_t k = 0; k < P->track.size(); k++) {
+                const TrackElement e = P->track[k];
+                if ((*drop)[k]) mi.img[e.image_id]->point3D_ids[e.point2D_idx] = kInvalidPoint3D;
+                else P->track[keep++] = e;
+            }
+            P->track.resize(keep);
+        }
+        return true;
+    }
 
     TieStats tieMerge(int round) {
         TieStats st;
@@ -5739,7 +5817,8 @@ private:
                 reg[i] = 1;
                 centers[i] = cameraCenter(mi.img[i]->pose);
             }
-        std::unordered_map<uint64_t, uint32_t> count;
+        struct TieCount { uint32_t all = 0, in = 0; };  // matches; those within the span
+        std::unordered_map<uint64_t, TieCount> count;
         for (uint32_t a = 0; a < n; a++) {
             if (!reg[a]) continue;
             const std::vector<uint64_t>& ids = mi.img[a]->point3D_ids;
@@ -5750,7 +5829,9 @@ private:
                     if (c.image_id <= a || !reg[c.image_id]) continue;
                     const uint64_t q = mi.img[c.image_id]->point3D_ids[c.feature_idx];
                     if (q == kInvalidPoint3D || q == p) continue;
-                    count[(std::min(p, q) << 32) | std::max(p, q)]++;
+                    TieCount& k = count[(std::min(p, q) << 32) | std::max(p, q)];
+                    k.all++;
+                    if (tie_span_ == 0 || tieGap(a, c.image_id) <= tie_span_) k.in++;
                 }
             }
         }
@@ -5758,8 +5839,10 @@ private:
         struct Tie { uint32_t n; uint64_t p, q; };
         std::vector<Tie> ties;
         for (const auto& kv : count)
-            if (kv.second >= (uint32_t)tie_merge_)
-                ties.push_back({kv.second, kv.first >> 32, kv.first & 0xffffffffull});
+            if (kv.second.in >= (uint32_t)tie_merge_)
+                ties.push_back({kv.second.in, kv.first >> 32, kv.first & 0xffffffffull});
+            else if (kv.second.all >= (uint32_t)tie_merge_)
+                st.refused_span++;
         std::sort(ties.begin(), ties.end(), [](const Tie& x, const Tie& y) {
             return x.n != y.n ? x.n > y.n : x.p != y.p ? x.p < y.p : x.q < y.q;
         });
@@ -5805,7 +5888,8 @@ private:
             return r;
         };
         std::map<uint64_t, std::vector<Vec3>> starts;  // survivor -> its parts' positions
-        std::vector<uint8_t> on_track(n, 0);
+        std::vector<uint32_t> on_track(n, 0);  // 1 + the index in A's track
+        std::vector<std::pair<size_t, size_t>> both;
         for (const Tie& t : ties) {
             if (tie_near_ > 0 && (!is_close[t.p] || !is_close[t.q])) { st.distant++; continue; }
             uint64_t a = find(t.p), b = find(t.q);
@@ -5813,11 +5897,23 @@ private:
             Point3D* A = &rec_.points3D.at(a);
             Point3D* B = &rec_.points3D.at(b);
             if (!opt_.tracks.allowsMerge(A->track.size(), B->track.size())) { st.cap++; continue; }
-            bool clash = false;
-            for (const TrackElement& e : A->track) on_track[e.image_id] = 1;
-            for (const TrackElement& e : B->track) clash = clash || on_track[e.image_id];
+            both.clear();
+            for (size_t k = 0; k < A->track.size(); k++) on_track[A->track[k].image_id] = k + 1;
+            for (size_t k = 0; k < B->track.size(); k++)
+                if (on_track[B->track[k].image_id])
+                    both.push_back({on_track[B->track[k].image_id] - 1, k});
             for (const TrackElement& e : A->track) on_track[e.image_id] = 0;
-            if (clash) { st.clash++; continue; }
+            if (!both.empty() && !tie_resolve_) { st.clash++; continue; }
+            if (tie_maxspan_ > 0 && tieTrackSpan(A->track, B->track) > tie_maxspan_) {
+                st.refused_maxspan++;
+                continue;
+            }
+            if (!both.empty()) {
+                const size_t before = A->track.size() + B->track.size();
+                if (!tieResolve(*A, *B, both, mi)) { st.clash++; continue; }
+                st.resolved_clash++;
+                st.clash_dropped += before - A->track.size() - B->track.size();
+            }
             if (B->track.size() > A->track.size()) {
                 std::swap(a, b);
                 std::swap(A, B);
@@ -5845,10 +5941,7 @@ private:
             Point3D& pt = rec_.points3D.at(kv.first);
             std::vector<PointObservation> obs;
             obs.reserve(pt.track.size());
-            for (const TrackElement& e : pt.track)
-                obs.push_back({poseToP(mi.img[e.image_id]->pose),
-                               mi.cam[e.image_id]->bearing(kp(e.image_id, e.point2D_idx)),
-                               mi.cam[e.image_id]->errRad(err)});
+            for (const TrackElement& e : pt.track) obs.push_back(tieObs(mi, e));
             double best = std::numeric_limits<double>::infinity();
             for (const Vec3& s : kv.second) {
                 const Vec3 x = refineTriangulatedPoint(s, obs, 20);
@@ -5885,11 +5978,14 @@ private:
         st.points_after = rec_.points3D.size();
         const std::string f = MapTrace::fields(
             "round=%d linked=%zu candidates=%zu merged=%zu joined=%zu clash=%zu cap=%zu far=%zu "
-            "kept_obs=%zu dropped_obs=%zu points_before=%zu points_after=%zu", round, st.linked,
+            "kept_obs=%zu dropped_obs=%zu points_before=%zu points_after=%zu refused_span=%zu "
+            "refused_maxspan=%zu resolved_clash=%zu clash_dropped=%zu", round, st.linked,
             st.candidates, st.merged, st.joined, st.clash, st.cap, st.distant, st.kept_obs,
-            st.dropped_obs, st.points_before, st.points_after);
-        slog::diag(slog::Tag::Map, "[tie] n=%d near=%d keep=%d %s", tie_merge_, tie_near_,
-                   tie_keep_, f.c_str());
+            st.dropped_obs, st.points_before, st.points_after, st.refused_span, st.refused_maxspan,
+            st.resolved_clash, st.clash_dropped);
+        slog::diag(slog::Tag::Map, "[tie] n=%d near=%d keep=%d span=%d maxspan=%d resolve=%d %s",
+                   tie_merge_, tie_near_, tie_keep_, tie_span_, tie_maxspan_, tie_resolve_,
+                   f.c_str());
         trace("tie_merge", f);
         return st;
     }
@@ -6480,6 +6576,9 @@ private:
     const int tie_merge_ = experimentInt("SFM_TIE_MERGE", 0, 1000000);  // tieMerge(); 0 = off
     const int tie_near_ = experimentInt("SFM_TIE_NEAR", 0, 1000000);
     const int tie_keep_ = experimentInt("SFM_TIE_KEEP", 1, 1);
+    const int tie_span_ = experimentInt("SFM_TIE_SPAN_IMAGES", 0, 1000000);     // 0 = off
+    const int tie_maxspan_ = experimentInt("SFM_TIE_MAXSPAN_IMAGES", 0, 1000000);
+    const int tie_resolve_ = tieClashMode();
     // Counted from const passes that fan out over threads (the audit, the
     // seed prefetch).
     mutable std::atomic<uint32_t> prior_vouched_{0}, prior_seeds_{0};
