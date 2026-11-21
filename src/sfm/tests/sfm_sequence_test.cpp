@@ -5,9 +5,18 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "sfm/core/Sequence.h"
 #include "sfm/feature/Pairing.h"
@@ -206,6 +215,171 @@ static void testMapperWalk(int device, bool verbose) {
     check(err >= 0 && err < 0.05, "the copy of the room is not folded onto the original");
 }
 
+#ifndef _WIN32
+// The mapper's verbose log of one run, from stdout and stderr, with every number that is a
+// time (hh:mm:ss.mmm, "N s", "N ms") blanked.
+static std::vector<std::string> mapperLog(const Walk& w, const MapperOptions& opt,
+                                          const SequenceTable& seqs, const std::string& path,
+                                          std::vector<Reconstruction>& out) {
+    fflush(stdout);
+    fflush(stderr);
+    const int o = dup(1), e = dup(2);
+    FILE* f = fopen(path.c_str(), "w");
+    dup2(fileno(f), 1);
+    dup2(fileno(f), 2);
+    {
+        Mapper m(w.db, w.feats, opt, {}, nullptr, &seqs);
+        out = m.run();
+    }
+    fflush(stdout);
+    fflush(stderr);
+    dup2(o, 1);
+    dup2(e, 2);
+    close(o);
+    close(e);
+    fclose(f);
+    std::vector<std::string> lines;
+    std::ifstream in(path);
+    for (std::string l; std::getline(in, l);) {
+        std::string t;
+        for (size_t i = 0; i < l.size();) {
+            if (l[i] < '0' || l[i] > '9') {
+                t += l[i++];
+                continue;
+            }
+            size_t j = l.find_first_not_of("0123456789.:", i);
+            if (j == std::string::npos) j = l.size();
+            const std::string run = l.substr(i, j - i), rest = l.substr(j, 3);
+            auto unit = [&](const char* u) {
+                const size_t n = std::strlen(u);
+                return rest.compare(0, n, u) == 0 &&
+                       (rest.size() <= n || !std::isalpha((unsigned char)rest[n]));
+            };
+            const bool time = run.find(':') != std::string::npos || unit(" s") || unit("s") ||
+                              unit(" ms") || unit("ms");
+            t += time ? "#" : run;
+            i = j;
+        }
+        lines.push_back(t);
+    }
+    return lines;
+}
+
+static bool sameModel(const Reconstruction& a, const Reconstruction& b) {
+    if (a.points3D.size() != b.points3D.size() || a.images.size() != b.images.size()) return false;
+    for (const auto& kv : a.images) {
+        auto it = b.images.find(kv.first);
+        if (it == b.images.end() || it->second.registered != kv.second.registered ||
+            it->second.pose.R != kv.second.pose.R || it->second.pose.t.x != kv.second.pose.t.x ||
+            it->second.pose.t.y != kv.second.pose.t.y || it->second.pose.t.z != kv.second.pose.t.z)
+            return false;
+    }
+    for (const auto& kv : a.cameras) {
+        auto it = b.cameras.find(kv.first);
+        if (it == b.cameras.end() || it->second.fx != kv.second.fx || it->second.k1 != kv.second.k1)
+            return false;
+    }
+    return true;
+}
+
+// SS_SFM_TRACE_DIR (sfm/map/Trace.h): off writes nothing; on, the same model and the same log,
+// and one readable snapshot per events.log line.
+static void testTrace(int device) {
+    namespace fs = std::filesystem;
+    Walk w = makeWalk();
+    MapperOptions opt;
+    opt.verbose = true;
+    opt.focal = w.focal;
+    opt.device = device;
+    std::vector<SequenceDef> defs(1);
+    defs[0].members = {""};
+    const SequenceTable seqs = buildSequenceTable(w.names, defs);
+    const fs::path root = fs::temp_directory_path() / ("sfm_trace_test_" + std::to_string(getpid()));
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path dir = root / "trace";
+    unsetenv("SS_SFM_TRACE_DIR");
+
+    std::vector<Reconstruction> off, on;
+    const std::vector<std::string> log_off = mapperLog(w, opt, seqs, (root / "off.log").string(), off);
+    check(!fs::exists(dir), "tracing off writes no trace");
+
+    setenv("SS_SFM_TRACE_DIR", dir.string().c_str(), 1);
+    setenv("SS_SFM_TRACE_IMAGES", "10-30", 1);
+    setenv("SS_SFM_TRACE_POINTS", "50", 1);
+    const std::vector<std::string> log_on = mapperLog(w, opt, seqs, (root / "on.log").string(), on);
+    unsetenv("SS_SFM_TRACE_DIR");
+    unsetenv("SS_SFM_TRACE_IMAGES");
+    unsetenv("SS_SFM_TRACE_POINTS");
+
+    check(!off.empty() && !on.empty() && off.size() == on.size() && sameModel(off[0], on[0]),
+          "tracing on gives the same model");
+    size_t diff = log_off.size() == log_on.size() ? 0 : 1;
+    for (size_t i = 0; i < std::min(log_off.size(), log_on.size()); i++)
+        if (log_off[i] != log_on[i]) {
+            if (!diff) printf("  log differs at line %zu:\n    %s\n    %s\n", i, log_off[i].c_str(),
+                              log_on[i].c_str());
+            diff++;
+        }
+    check(diff == 0 && log_off.size() > 20, "tracing on leaves the log line for line as it was");
+
+    std::ifstream ev((dir / "events.log").string());
+    size_t lines = 0, regs = 0, bas = 0, filters = 0, seeds = 0, bins = 0, sampled_ok = 0;
+    for (std::string l; std::getline(ev, l); lines++) {
+        std::istringstream ls(l);
+        std::string idx, type;
+        ls >> idx >> type;
+        regs += type == "reg";
+        bas += type == "ba";
+        filters += type == "filter";
+        seeds += type == "seed";
+        std::ifstream b((dir / MapTrace::fileName((uint32_t)std::stoul(idx))).string(), std::ios::binary);
+        char magic[4] = {};
+        uint32_t ver = 0, index = 0;
+        b.read(magic, 4);
+        b.read((char*)&ver, 4);
+        b.read((char*)&index, 4);
+        if (b && std::string(magic, 4) == "SSMT" && ver == 1 && index == std::stoul(idx)) bins++;
+        uint32_t mapper = 0, nimg = 0, ncam = 0, lo = 0, hi = 0, take = 0;
+        char type16[16];
+        uint64_t npts = 0, nobs = 0, nwin = 0;
+        b.read((char*)&mapper, 4);
+        b.read(type16, 16);
+        b.read((char*)&nimg, 4);
+        b.seekg(nimg * (8 + 12 * 8), std::ios::cur);
+        b.read((char*)&ncam, 4);
+        b.seekg(ncam * (16 + 14 * 8), std::ios::cur);
+        b.read((char*)&npts, 8);
+        b.read((char*)&nobs, 8);
+        b.read((char*)&lo, 4);
+        b.read((char*)&hi, 4);
+        b.read((char*)&nwin, 8);
+        b.read((char*)&take, 4);
+        b.seekg(take * 16, std::ios::cur);
+        const bool at_end = b && b.peek() == EOF;
+        if (at_end && lo == 10 && hi == 30 && take <= 50 && take <= nwin && nwin <= npts) sampled_ok++;
+    }
+    printf("trace: %zu events (%zu registrations, %zu BAs, %zu filters, %zu seeds), %zu snapshots "
+           "read\n", lines, regs, bas, filters, seeds, bins);
+    check(lines > 0 && bins == lines && sampled_ok == lines, "one well-formed snapshot per event");
+    check(regs + 2 * seeds >= on[0].numRegistered() && bas > 0 && filters == bas && seeds > 0,
+          "registrations, seeds, BAs and filters are traced");
+
+    setenv("SS_SFM_TRACE_DIR", (root / "bad").string().c_str(), 1);
+    setenv("SS_SFM_TRACE_IMAGES", "9", 1);
+    bool threw = false;
+    try {
+        Mapper m(w.db, w.feats, opt, {}, nullptr, &seqs);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    unsetenv("SS_SFM_TRACE_DIR");
+    unsetenv("SS_SFM_TRACE_IMAGES");
+    check(threw, "an invalid SS_SFM_TRACE_IMAGES is refused");
+    fs::remove_all(root);
+}
+#endif
+
 static int cmdSequenceTest(int argc, char** argv) {
     int device = -1;
     bool verbose = false, gpu = true;
@@ -217,6 +391,9 @@ static int cmdSequenceTest(int argc, char** argv) {
     }
     testTable();
     if (gpu) testMapperWalk(device, verbose);
+#ifndef _WIN32
+    if (gpu) testTrace(device);
+#endif
     printf("%s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }

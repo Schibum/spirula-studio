@@ -521,7 +521,8 @@ inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared
 // Global BA over all registered images and all 3D points. Overwrites poses,
 // point positions, and intrinsics in `rec`. Returns the final RMS reprojection
 // cost reported by the solver (0 if nothing to optimize).
-inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
+inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt,
+                          SolverStats* out_stats = nullptr) {
     auto prof_t0 = std::chrono::steady_clock::now();
     auto prof_lap = [&prof_t0] {
         auto t1 = std::chrono::steady_clock::now();
@@ -566,6 +567,7 @@ inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
                                    : "",
                    stats.prior_initial, stats.prior_final, stats.prior_steps,
                    stats.final_damping, stats.initial_cost, stats.final_cost, grad);
+    if (out_stats) *out_stats = stats;
     return stats.final_cost;
 }
 

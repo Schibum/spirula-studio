@@ -59,6 +59,7 @@
 // include this header, so there is no cycle.
 #include "sfm/map/Merge.h"
 #include "sfm/map/Profile.h"
+#include "sfm/map/Trace.h"
 #include "sfm/map/TrackPolicy.h"
 #include "core/Env.h"
 #include "core/HardwareThreads.h"
@@ -397,9 +398,22 @@ public:
           priors_(priors && opt.use_priors ? priors : nullptr) {
         opt_.tracks.readExperiments();
         opt_.seed_essential = experimentInt("SFM_SEED_ESSENTIAL", opt_.seed_essential, 3);
+        trace_ = MapTrace::attach();
+        if (trace_) {
+            std::vector<std::string> names;
+            for (const auto& e : db_.images) names.push_back(e.name);
+            trace_id_ = trace_->newMapper(names);
+            trace("mapper", MapTrace::fields("images=%zu", db_.images.size()));
+        }
     }
 
     const RigTable* rigs() const { return rigs_; }
+
+    // One SS_SFM_TRACE_DIR snapshot per model (sfm/map/Trace.h); nothing without it.
+    void traceModels(const char* type, const std::vector<Reconstruction>& models) {
+        for (size_t i = 0; i < models.size(); i++)
+            traceModel(type, models[i], MapTrace::fields("model=%zu of=%zu", i, models.size()));
+    }
     const SequenceTable* sequences() const { return seq_; }
     PriorSource* priors() const { return priors_; }
 
@@ -485,6 +499,7 @@ public:
             }
             globalRefine(false);  // COLMAP's two-view BA before any growth
             grow();
+            trace("attempt_done", MapTrace::fields("attempt=%d", attempt));
             uint32_t reg = rec_.numRegistered();
             if (reg) {
                 attempts.push_back(snapshotModel());
@@ -534,7 +549,10 @@ public:
         // Seeds come only from images no kept model registered, so this does
         // nothing at all when the primary model covers the dataset -- a
         // single-component capture takes the pre-D41 path exactly.
-        seedFurtherModels(models);
+        {
+            TracePhase tp(*this, "further");
+            seedFurtherModels(models);
+        }
         return finishRun(models, prof_start);
     }
 
@@ -576,6 +594,7 @@ public:
     Reconstruction continueFrom(const Reconstruction& m, GrowStats* out = nullptr,
                                 const std::vector<const Reconstruction*>& others = {},
                                 uint32_t max_reg = 0) {
+        TracePhase tp(*this, "continue");
         ensureSetup();
         resetModel();
         adopt(m);
@@ -781,6 +800,7 @@ public:
     Reconstruction growByPnP(const Reconstruction& m, GrowStats* out,
                              const std::vector<const Reconstruction*>& others, uint32_t max_reg,
                              uint32_t* rejected = nullptr) {
+        TracePhase tp(*this, "grow-pnp");
         ensureSetup();
         resetModel();
         adopt(m);
@@ -1126,6 +1146,7 @@ public:
     // filter in the first round, which is what lets them pull the two sides together. `m`
     // comes back as it was with no open seam, or when the weld does not hold (weldFailure).
     Reconstruction weldSeams(const Reconstruction& m, SeamStats* out = nullptr) {
+        TracePhase tp(*this, "weld");
         SeamStats st;
         std::vector<SeamPair> cand;
         st.open = openSeams(m, &st.strong, &cand);
@@ -1282,6 +1303,7 @@ public:
         // where it started.
         const bool extra = free_extra && !opt_.refine_extra_params;
         if (!pp && !extra) return m;
+        TracePhase tp(*this, "polish");
         ensureSetup();
         resetModel();
         adopt(m);
@@ -1320,6 +1342,7 @@ public:
     // being built; only a complete one can pay for each frame to depart.
     Reconstruction perImageIntrinsics(const Reconstruction& m, bool free_extra = true) {
         if (m.numRegistered() < 2) return m;
+        TracePhase tp(*this, "per-image");
         ensureSetup();
         resetModel();
         adopt(m);
@@ -1898,6 +1921,8 @@ public:
         // through the ordinary gates.
         clearCameraConsensus();
         for (const Reconstruction& m : models) recordCameras(m);
+        for (size_t i = 0; i < models.size(); i++)
+            traceModel("joint_ba", models[i], MapTrace::fields("model=%zu of=%zu", i, models.size()));
     }
 
 private:
@@ -2780,6 +2805,7 @@ private:
         if (missing && opt_.verbose)
             slog::diag(slog::Tag::Map, "[map] adopted model: %zu image(s) not in this database",
                        missing);
+        trace("adopt");
     }
 
 
@@ -2793,6 +2819,8 @@ private:
                          [](const Reconstruction& a, const Reconstruction& b) {
                              return a.points3D.size() > b.points3D.size();
                          });
+        for (size_t i = 0; i < models.size(); i++)
+            traceModel("run_done", models[i], MapTrace::fields("model=%zu of=%zu", i, models.size()));
         if (opt_.verbose) {
             // Distinct, not the sum: models overlap by design (up to
             // max_model_overlap), so summing would double-count the joins.
@@ -3052,10 +3080,20 @@ private:
                     g_map_prof.n_reg_ok++;
                     registered = true;
                     registered_here++;
+                    size_t pts0 = 0, obs0 = 0;
+                    if (trace_) {
+                        traceRegistration(img);
+                        pts0 = rec_.points3D.size();
+                        obs0 = countObservations();
+                    }
                     {
                         ProfTimer pt(g_map_prof.tri);
                         triangulateForImage(img);
                     }
+                    if (trace_)
+                        trace("tri", MapTrace::fields("img=%u new_points=%zu new_obs=%zd", img,
+                                                      rec_.points3D.size() - pts0,
+                                                      (ptrdiff_t)(countObservations() - obs0)));
                     recent_regs_.push_back(img);
                     gps_regs_since_ba_++;
                     gpsScaleCheck(img);
@@ -3166,6 +3204,7 @@ private:
                           "; keeping current model");
             restoreSnapshot(snap);
             recent_regs_.clear();
+            trace("refine_failed");
             return;
         }
         // Collapse = losing half the registered images. Observation loss alone
@@ -3182,6 +3221,7 @@ private:
             restoreSnapshot(snap);
             for (uint32_t img : recent_regs_) deregisterImage(img);
             resetOrphanCameras();
+            trace("collapse_undo", MapTrace::fields("before=%u", reg_before));
         }
         recent_regs_.clear();
         bssAfterBa();
@@ -3444,6 +3484,7 @@ private:
             im.point3D_ids.assign(feats_[i].count(), kInvalidPoint3D);
         }
         reg_trials_.assign(db_.images.size(), 0);
+        trace("reset");
     }
 
     // ---- initialization ----
@@ -3544,6 +3585,7 @@ private:
     // right focal against 52k at 1.9x it, with the residual flat throughout.
     FocalTrial focalTrial(const TwoViewMatches& pm, const std::vector<uint32_t>& cams,
                           double focal, uint32_t cap) {
+        TracePhase tp(*this, "focal-trial");
         for (uint32_t cid : cams) {
             default_cams_[cid].setFocal(focal);
             resetExtraParams(default_cams_[cid]);
@@ -3592,6 +3634,7 @@ private:
         if (opt_.focal_trials <= 0) return;
         std::vector<uint32_t> cams = guessedFocalCameras();
         if (cams.empty()) return;
+        TracePhase tp(*this, "focal-probe");
         // The trials are thrown away, but the bar counts the capture: a probe
         // registering `focal_model_size` images jumped it to 30% of a 70-image
         // capture and froze. A fifth of the stage there, hence a stage to name.
@@ -3729,6 +3772,7 @@ private:
         seed_pair_ = nullptr;
         init_relax_ = seed_phase_ = 0;
         resetModel();
+        trace("focal_commit", MapTrace::fields("focal=%.3f probe_focal=%.3f", focal, probe_focal));
     }
 
     // `from` is an in/out cursor into the ranked candidate list, so a retry
@@ -4078,6 +4122,8 @@ private:
         seed_forward_ = fwd;
         completeFrameOf(a);
         completeFrameOf(b);
+        trace("seed", MapTrace::fields("a=%u b=%u inliers=%d median_angle=%.2f", a, b,
+                                       g.num_inliers, candidate.median_angle));
         if (opt_.verbose)
             slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_init_pair,
                      {(long long)a, (long long)b, (long long)candidate.created,
@@ -4482,6 +4528,7 @@ private:
             frame_regs_ += placed - (self ? 1 : 0);
             return self;
         }
+        if (trace_) trace_reg_ = TraceReg{};
         if (registerFrame(img)) return true;
         std::vector<Vec3> X;
         std::vector<Vec3> br;   // observed unit bearings
@@ -4564,6 +4611,10 @@ private:
                 rec_.cameras[cid].setFocal(refined);
                 for (size_t k = 0; k < feat.size(); k++) br[k] = bearing(img, feat[k]);
             }
+            if (trace_) {
+                trace_reg_.focal_from = f0;
+                trace_reg_.focal_to = camOf(img).focal();
+            }
             if (opt_.verbose && std::fabs(camOf(img).focal() - f0) > 1e-6)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_camera_focal,
                          {(long long)cid, slog::num(f0, 0),
@@ -4599,6 +4650,7 @@ private:
         if (pool < X.size()) reg_fail_.occluded += (uint32_t)(X.size() - pool);
         focal_known_.insert(cid);
 
+        if (trace_) traceCandidates(img, X, r, pool);
         commitPose(img, r.pose, feat, pid, r.inlier_mask, r.num_inliers, X.size());
         return true;
     }
@@ -5452,6 +5504,9 @@ private:
                                         (opt_.tracks.completion == 3 && final_pass &&
                                          rec_.numRegistered() >= (uint32_t)std::max(3, opt_.min_model_size));
             size_t track_changes = 0;
+            if (trace_)
+                trace("ba_begin", MapTrace::fields("round=%d final=%d tight=%d", i + 1,
+                                                   (int)final_pass, (int)tight));
             if ((i > 0 || complete_first) && opt_.retri_scale > 0 && !final_.no_retri) {
                 ProfTimer pt(g_map_prof.retri);
                 track_changes = completeAndRetriangulate();
@@ -5499,19 +5554,32 @@ private:
                         bo.metres_per_unit = std::sqrt(A[0] * A[0] + A[3] * A[3] + A[6] * A[6]);
                 }
             }
+            SolverStats ba_stats;
+            SolverStats* ba_out = trace_ ? &ba_stats : nullptr;
             if (fixed_rotation_stage) {
                 BundleOptions fixed = bo;
                 fixed.fix_rotations = true;
-                runGlobalBA(rec_, fixed);
+                runGlobalBA(rec_, fixed, ba_out);
+                if (trace_) traceBa("ba_fixed_rot", i + 1, ba_stats);
             }
-            double cost = runGlobalBA(rec_, bo);
+            double cost = runGlobalBA(rec_, bo, ba_out);
+            if (trace_) traceBa("ba", i + 1, ba_stats);
             if (rigs_ && !final_.no_rig) snapRigFrames();
             ProfTimer pt(g_map_prof.filter);
             // Unbounded distortion can flatten a model while keeping residuals low.
             // Disabling sanitization took AUC@10 from 84.3 to 0.0 on an 811-image capture.
+            std::map<uint32_t, Camera> cams_before;
+            if (trace_) cams_before = rec_.cameras;
             if (!final_.no_sanitize) sanitizeCameras();
+            if (trace_) traceSanitize(cams_before);
             int removedObs = 0, removedPts = 0;
             filterPoints(removedObs, removedPts, weld_round ? &welded : nullptr);
+            if (trace_)
+                trace("filter", MapTrace::fields(
+                                    "round=%d removed_obs=%d removed_pts=%d reproj_obs=%d "
+                                    "short_pts=%d angle_pts=%d spared=%zu", i + 1, removedObs,
+                                    removedPts, filter_last_.reproj_obs, filter_last_.short_pts,
+                                    filter_last_.angle_pts, weld_round ? welded.size() : 0));
             if (opt_.verbose) {
                 char cost_s[32];
                 std::snprintf(cost_s, sizeof cost_s, "%.3e", cost);
@@ -5535,6 +5603,7 @@ private:
             ProfTimer pt(g_map_prof.filter);
             dropped = filterImages();
         }
+        if (trace_) trace("filter_images", MapTrace::fields("dropped=%d", dropped));
         if (dropped && opt_.verbose)
             slog::diag(slog::Tag::Map,
                        "[map] de-registered %d image(s) (few points or bogus camera), "
@@ -5729,6 +5798,14 @@ private:
             g_map_prof.n_merged += merged;
         }
         if (MapProf::enabled()) g_map_prof.track_completed += completed;
+        if (trace_) {
+            size_t made_n = 0;
+            for (const auto& per : made)
+                for (const auto& v : per) made_n += v.size();
+            trace("retri", MapTrace::fields("completed_obs=%zu tracks_collected=%zu merged=%zu "
+                                            "obs_change=%zd", completed, made_n, merged,
+                                            (ptrdiff_t)(countObservations() - before)));
+        }
         return countObservations() - before + merged;
     }
 
@@ -5810,7 +5887,7 @@ private:
         for (auto& kv : rec_.points3D) pts.emplace_back(kv.first, &kv.second);
 
         std::vector<uint64_t> drop;
-        std::atomic<int> removed_obs_atomic{0};
+        std::atomic<int> removed_obs_atomic{0}, reproj_obs_atomic{0}, short_pts_atomic{0};
         const unsigned hc = spirula::hardware_threads();
         int nt = opt_.threads > 0 ? opt_.threads : (hc > 0 ? (int)hc : 1);
         nt = std::max(1, std::min<int>(nt, (int)std::max<size_t>(pts.size() / 512, 1)));
@@ -5819,7 +5896,7 @@ private:
         const size_t kBlock = 256;
 
         auto worker = [&](int t) {
-            int local_removed = 0;
+            int local_removed = 0, local_reproj = 0, local_short = 0;
             std::vector<uint64_t>& local_drop = drop_per_thread[t];
             for (;;) {
                 const size_t b = next.fetch_add(kBlock);
@@ -5837,10 +5914,12 @@ private:
                         } else {
                             mi.img[el.image_id]->point3D_ids[el.point2D_idx] = kInvalidPoint3D;
                             local_removed++;
+                            local_reproj++;
                         }
                     }
                     pt.track.resize(keep);
                     bool degenerate = pt.track.size() < 2;
+                    local_short += degenerate ? 1 : 0;
                     if (!degenerate) {
                         double best = 0;
                         for (size_t i = 0; i + 1 < pt.track.size() && best < min_ang; i++)
@@ -5861,6 +5940,8 @@ private:
                 }
             }
             removed_obs_atomic += local_removed;
+            reproj_obs_atomic += local_reproj;
+            short_pts_atomic += local_short;
         };
         if (nt == 1) {
             worker(0);
@@ -5874,6 +5955,8 @@ private:
         for (const std::vector<uint64_t>& d : drop_per_thread)
             drop.insert(drop.end(), d.begin(), d.end());
         for (uint64_t id : drop) { rec_.points3D.erase(id); removedPts++; }
+        filter_last_ = {reproj_obs_atomic.load(), short_pts_atomic.load(),
+                        (int)drop.size() - short_pts_atomic.load()};
     }
 
     // Undo a registration: detach every observation, drop tracks that fall
@@ -6268,6 +6351,86 @@ private:
         return ba_ctx_[second];
     }
     std::vector<uint32_t> recent_regs_;  // registered since the last refinement
+
+    struct FilterLast { int reproj_obs = 0, short_pts = 0, angle_pts = 0; } filter_last_;
+
+    // ---- SS_SFM_TRACE_DIR (sfm/map/Trace.h); every hook is a no-op with trace_ null ----
+    MapTrace* trace_ = nullptr;
+    uint32_t trace_id_ = 0;
+    const char* trace_phase_ = "map";
+    struct TraceReg {
+        uint32_t img = ~0u;
+        size_t pool = 0, visible = 0, near_pool = 0, near_inliers = 0;
+        int inliers = 0;
+        double baseline = 0, focal_from = 0, focal_to = 0;
+    } trace_reg_;
+    struct TracePhase {
+        Mapper& m;
+        const char* was;
+        TracePhase(Mapper& mm, const char* p) : m(mm), was(mm.trace_phase_) { m.trace_phase_ = p; }
+        ~TracePhase() { m.trace_phase_ = was; }
+    };
+    void trace(const char* type, const std::string& f = {}) {
+        if (trace_) trace_->event(type, trace_id_, trace_phase_, rec_, f);
+    }
+    void traceModel(const char* type, const Reconstruction& m, const std::string& f) {
+        if (trace_) trace_->event(type, trace_id_, trace_phase_, m, f);
+    }
+    // Near = closer to the new camera than 20 baselines, the baseline being the distance to
+    // the closest registered image within 10 ids (else to any registered image).
+    void traceCandidates(uint32_t img, const std::vector<Vec3>& X, const PnPResult& r,
+                         size_t pool) {
+        const Vec3 c = cameraCenter(r.pose);
+        double near_b = 0, any_b = 0;
+        for (const auto& kv : rec_.images) {
+            if (!kv.second.registered || kv.first == img) continue;
+            const double d = (cameraCenter(kv.second.pose) - c).norm();
+            if (any_b == 0 || d < any_b) any_b = d;
+            const uint32_t gap = kv.first > img ? kv.first - img : img - kv.first;
+            if (gap <= 10 && (near_b == 0 || d < near_b)) near_b = d;
+        }
+        TraceReg& t = trace_reg_;
+        t.img = img;
+        t.pool = X.size();
+        t.visible = pool;
+        t.inliers = r.num_inliers;
+        t.baseline = near_b > 0 ? near_b : any_b;
+        for (size_t k = 0; k < X.size(); k++) {
+            if (!(t.baseline > 0) || (X[k] - c).norm() >= 20 * t.baseline) continue;
+            t.near_pool++;
+            if (k < r.inlier_mask.size() && r.inlier_mask[k]) t.near_inliers++;
+        }
+    }
+    void traceRegistration(uint32_t img) {
+        const TraceReg& t = trace_reg_;
+        if (t.img != img) {
+            trace("reg", MapTrace::fields("img=%u frame=1", img));
+            return;
+        }
+        trace("reg", MapTrace::fields("img=%u pool=%zu visible=%zu inliers=%d near_pool=%zu "
+                                      "near_inliers=%zu baseline=%.6g focal_from=%.3f "
+                                      "focal_to=%.3f", img, t.pool, t.visible, t.inliers,
+                                      t.near_pool, t.near_inliers, t.baseline, t.focal_from,
+                                      t.focal_to));
+    }
+    void traceBa(const char* type, int round, const SolverStats& st) {
+        trace(type, MapTrace::fields("round=%d cost0=%.6e cost1=%.6e iters=%d solver=%s",
+                                     round, st.initial_cost, st.final_cost, st.iterations,
+                                     st.solver ? st.solver : "-"));
+    }
+    void traceSanitize(const std::map<uint32_t, Camera>& before) {
+        int changed = 0;
+        for (const auto& kv : rec_.cameras) {
+            auto it = before.find(kv.first);
+            if (it == before.end()) continue;
+            const Camera& a = it->second;
+            const Camera& b = kv.second;
+            changed += (a.fx != b.fx || a.fy != b.fy || a.cx != b.cx || a.cy != b.cy ||
+                        a.k1 != b.k1 || a.k2 != b.k2 || a.p1 != b.p1 || a.p2 != b.p2 ||
+                        a.k3 != b.k3 || a.k4 != b.k4) ? 1 : 0;
+        }
+        if (changed) trace("sanitize", MapTrace::fields("cameras=%d", changed));
+    }
 };
 
 }  // namespace sfm

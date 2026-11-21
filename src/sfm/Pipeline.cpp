@@ -2879,6 +2879,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     Mapper mapper(db, feats, mapopt, cs.ids, &rigs, &seqs, mapped);
     AssembleStats ast;
     std::vector<Reconstruction> models = runMapper(mapper, db, feats, cfg, ast);
+    mapper.traceModels("assembled", models);
     double t_map = now() - t0;
     if (models.empty()) {
         L::fail(Tag::Map, M::map_no_model_to_work_with);
@@ -2904,12 +2905,14 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
         t_map += t_finish;
         events::stage_end(Stage::Refine);
     }
+    mapper.traceModels("finished", models);
     events::stage_end(Stage::Map);
 
     resolveImageNames(models, _imagedir);
     std::vector<ModelGauge> gauge;
     const bool auto_metric = fixGauge(models, cfg, _imagedir, verbose, gauge, &sensors, mapped);
     recolorPoints(models, cfg);
+    mapper.traceModels("gauged", models);
     // The gauge is what a screen was missing: every snapshot before this one is
     // in the seed pair's frame, so a run watched to the end left a tilted model
     // on display until the user opened the written one.

@@ -1314,6 +1314,41 @@ Two things about that metric are worth knowing before reading a number:
   into its rotations. That shows up as a uniform relative-rotation error of
   about `dx / f` radians and it is not necessarily the model being worse.
 
+## Mapper trace
+
+`SS_SFM_TRACE_DIR=<dir>` makes the incremental mapper (`sfm/map/Trace.h`) write a
+snapshot of its model after every event, for working out offline which
+operation moved a model (for instance where a stretch's scale departs). It only
+reads the model: unset, every hook is skipped, and set, the model and the log are
+the ones the run gives without it (`sfm_sequence_test` checks both).
+`SS_SFM_TRACE_IMAGES=lo-hi` (image ids, inclusive) adds the points those images
+see, at most `SS_SFM_TRACE_POINTS` (2000) per snapshot, strided over point ids.
+
+`<dir>/names.tsv` maps image ids to names. `<dir>/events.log` has one line per
+event: index, type, `mapper=` (instance), `phase=` (`map`, `focal-probe`,
+`focal-trial`, `further`, `continue`, `grow-pnp`, `polish`, `per-image`,
+`weld`), registered images, points, observations, the first camera's focal,
+principal point, k1, k2, `step_win` / `step_all` (median distance between
+consecutive registered images over their id gap, in the window / overall), their
+ratio, the event's own fields, and `added=` / `removed=` registered ids since the
+previous event. Types: `mapper`, `reset`, `adopt`, `seed`, `reg` (pool, visible
+pool, PnP inliers, pool points nearer than 20 baselines, baseline, a swept
+focal), `tri` (new points and observations), `ba_begin`, `retri` (completed
+observations, collected tracks, merged), `ba_fixed_rot`, `ba` (cost before and
+after, iterations), `sanitize`, `filter` (observations over the reprojection
+bound, points left with under two views, points under the triangulation angle),
+`filter_images`, `refine_failed`, `collapse_undo`, `focal_commit`,
+`attempt_done`, `run_done`, `joint_ba`, and the pipeline's `assembled`,
+`finished` and `gauged` per model.
+
+`<dir>/eNNNNNN.bin`, little-endian, packed: `SSMT`, u32 version (1), u32 index,
+u32 mapper, char[16] type; u32 n, then per registered image u32 id, u32 camera,
+f64[3] centre, f64[9] world-to-camera rotation (row-major); u32 n, then per
+camera u32 id, u32 model, u32 width, u32 height, f64[14] fx fy cx cy k1 k2 p1
+p2 k3 k4 k5 k6 sx1 sy1; u64 points, u64 observations, u32 window lo, u32 window
+hi (lo > hi: none), u64 points the window sees, u32 n, then per sampled point
+f32[3] xyz, u16 track length, u16 observations in the window.
+
 ## Quality experiments
 
 The [SfM quality review](../../docs/notes/sfm-quality-review.md) ranks proposed
