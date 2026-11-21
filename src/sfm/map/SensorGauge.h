@@ -32,12 +32,40 @@ struct SensorCapture {
     std::string prefix;        // image names under this prefix; "" covers all
     std::string path;          // for reporting
     std::string camera;        // the file's camera string
-    double fps = 0;            // frame index in the stem -> seconds
+    double fps = 0;            // frame index in the stem -> seconds, when there is no table
+    // Seconds at which source frame n was shown, by frame index; empty: by
+    // `fps`. From a manifest's frame_times file or the video's sample table.
+    std::vector<double> frame_times;
     double time_offset = 0;    // seconds added to every frame time
     double readout = 0;        // rolling-shutter readout, seconds
     const SensorTimeline* timeline = nullptr;
     TelemetryCarrier carrier = TelemetryCarrier::None;
 };
+
+// Whether the capture can time a frame at all.
+inline bool timesFrames(const SensorCapture& cap) {
+    return !cap.frame_times.empty() || cap.fps > 0;
+}
+
+// The time of source frame `idx` on the capture's clock: its entry in the
+// table, else index over rate, plus half the readout and the capture's
+// offset. Every stage that holds a frame against the sensors asks here.
+// False when the frame has no time: an index the table does not hold is
+// never extrapolated.
+inline bool frameTime(const SensorCapture& cap, int idx, double& t) {
+    if (idx < 0) return false;
+    double shown;
+    if (!cap.frame_times.empty()) {
+        if ((size_t)idx >= cap.frame_times.size()) return false;
+        shown = cap.frame_times[(size_t)idx];
+    } else if (cap.fps > 0) {
+        shown = idx / cap.fps;
+    } else {
+        return false;
+    }
+    t = shown + 0.5 * cap.readout + cap.time_offset;
+    return true;
+}
 
 // The point every telemetry GPS position is stated east-north-up about: the
 // mean of all the captures' fixes, so the gauge and the mapper's priors share it.
@@ -209,19 +237,16 @@ private:
             if (!im.registered) continue;
             int best = -1;
             for (size_t c = 0; c < _caps.size(); c++) {
-                if (!_caps[c].timeline || !(_caps[c].fps > 0)) continue;
+                if (!_caps[c].timeline || !timesFrames(_caps[c])) continue;
                 if (!underPrefix(im.name, _caps[c].prefix)) continue;
                 if (best < 0 || _caps[c].prefix.size() > _caps[(size_t)best].prefix.size()) best = (int)c;
             }
-            const int idx = stemIndex(im.name);
-            if (best < 0 || idx < 0) {
+            SensorFrame f;
+            if (best < 0 || !frameTime(_caps[(size_t)best], stemIndex(im.name), f.t)) {
                 out.frames_untimed++;
                 continue;
             }
-            const SensorCapture& cap = _caps[(size_t)best];
-            SensorFrame f;
             f.image_id = kv.first;
-            f.t = idx / cap.fps + 0.5 * cap.readout + cap.time_offset;
             f.R = im.pose.R;
             f.c = cameraCenter(im.pose);
             f.capture = best;

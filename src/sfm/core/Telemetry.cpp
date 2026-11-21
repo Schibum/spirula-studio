@@ -187,6 +187,7 @@ struct Sample {
     uint64_t offset = 0;
     uint32_t size = 0;
     double t = 0;   // seconds, decode order
+    double pts = 0; // seconds, when it is shown: t plus its composition offset
 };
 
 struct Track {
@@ -197,6 +198,15 @@ struct Track {
     uint64_t duration = 0;
     int width = 0, height = 0;
     std::vector<Sample> samples;
+    // The edit list: movie time 0 shows media time `edit_media_time` (track
+    // timescale) after `edit_empty` (movie timescale) of nothing.
+    uint64_t edit_empty = 0;
+    int64_t edit_media_time = 0;
+    // Seconds to add to a media time to get movie time.
+    double editShift(uint32_t movie_timescale) const {
+        return (movie_timescale ? (double)edit_empty / movie_timescale : 0.0) -
+               (timescale ? (double)edit_media_time / timescale : 0.0);
+    }
     double fps() const {
         return (samples.size() > 1 && duration > 0 && timescale > 0)
                    ? (double)samples.size() / ((double)duration / timescale) : 0.0;
@@ -316,6 +326,42 @@ bool parse_trak(const uint8_t* data, size_t size, Track& tk) {
             for (uint32_t j = 0; j < n && k < tk.samples.size(); j++, k++) {
                 tk.samples[k].t = tk.timescale ? (double)dts / tk.timescale : 0.0;
                 dts += delta;
+            }
+        }
+    }
+    for (Sample& s : tk.samples) s.pts = s.t;
+    // Composition offsets (B-frames: shown in another order than decoded).
+    // Version 1 offsets are signed; version 0 writers store negative ones too.
+    if (find_box(stbl.payload, stbl.payload_size, fourcc("ctts"), b) && b.payload_size >= 8) {
+        const uint32_t count = be32(b.payload + 4);
+        if (b.payload_size < 8 + 8ull * count) return false;
+        size_t k = 0;
+        for (uint32_t i = 0; i < count && k < tk.samples.size(); i++) {
+            const uint32_t n = be32(b.payload + 8 + 8 * i);
+            const int32_t off = (int32_t)be32(b.payload + 12 + 8 * i);
+            for (uint32_t j = 0; j < n && k < tk.samples.size(); j++, k++)
+                if (tk.timescale) tk.samples[k].pts += (double)off / tk.timescale;
+        }
+    }
+    // The edit list: leading empty edits delay the track, the first real
+    // edit says which media time movie time starts at.
+    Box edts;
+    if (find_box(data, size, fourcc("edts"), edts) &&
+        find_box(edts.payload, edts.payload_size, fourcc("elst"), b) && b.payload_size >= 8) {
+        const bool v1 = b.payload[0] == 1;
+        const uint32_t count = be32(b.payload + 4);
+        const size_t entry = v1 ? 20 : 12;
+        if (b.payload_size >= 8 + entry * (size_t)count) {
+            for (uint32_t i = 0; i < count; i++) {
+                const uint8_t* e = b.payload + 8 + entry * i;
+                const uint64_t dur = v1 ? be64(e) : be32(e);
+                const int64_t media = v1 ? (int64_t)be64(e + 8) : (int64_t)(int32_t)be32(e + 4);
+                if (media < 0) {
+                    tk.edit_empty += dur;
+                    continue;
+                }
+                tk.edit_media_time = media;
+                break;
             }
         }
     }
@@ -1491,12 +1537,37 @@ bool read_carrier(const Source& src, Telemetry& out, std::string& error,
         out.video_unix_start = mv.unixStart();
         out.projection = mv.projection;
         for (const Track& tk : mv.tracks)
-            if (tk.handler == fourcc("vide") && tk.fps() > 0) { out.video_fps = tk.fps(); break; }
+            if (tk.handler == fourcc("vide") && tk.fps() > 0) {
+                out.video_fps = tk.fps();
+                // Every sample in the order shown, as the frame extractor
+                // counts them (video/Mp4Demuxer.cpp by_pts).
+                const double shift = tk.editShift(mv.timescale);
+                out.video_frame_times.reserve(tk.samples.size());
+                for (const Sample& s : tk.samples) out.video_frame_times.push_back(s.pts + shift);
+                std::stable_sort(out.video_frame_times.begin(), out.video_frame_times.end());
+                for (size_t i = 1; i < out.video_frame_times.size(); i++)
+                    if (!(out.video_frame_times[i] > out.video_frame_times[i - 1])) {
+                        out.video_frame_times.clear();   // no usable table: timed by rate
+                        break;
+                    }
+                break;
+            }
     }
     if (insta) return read_insta360(src, have_movie ? &mv : nullptr, out, error, original, original_name);
     for (const Track& tk : mv.tracks) {
         if (tk.sample_type == fourcc("gpmd")) { if (!read_gpmf(src, tk, out, error)) return false; }
-        else if (tk.sample_type == fourcc("camm")) { if (!read_camm(src, tk, out, error)) return false; }
+        else if (tk.sample_type == fourcc("camm")) {
+            // The sensor track on the movie's timeline too, so that it and the
+            // video's frame times share one clock when either has an edit list.
+            const double shift = tk.editShift(mv.timescale);
+            if (shift != 0) {
+                Track moved = tk;
+                for (Sample& s : moved.samples) s.t += shift;
+                if (!read_camm(src, moved, out, error)) return false;
+            } else if (!read_camm(src, tk, out, error)) {
+                return false;
+            }
+        }
         else if (tk.sample_type == fourcc("djmd")) { if (!read_dji(src, tk, out, error)) return false; }
         if (out.carrier != TelemetryCarrier::None) break;
     }

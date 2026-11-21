@@ -72,6 +72,10 @@ struct TelemetryInput {
     // Off drops that half of the file's readings before anything sees them;
     // the lens calibration it carries is still read.
     bool imu = true, gps = true;
+    // A frame-time file (core/FrameTimes.h): the frames under `prefix` are
+    // timed by its table instead of a rate. Empty: the video's own sample
+    // times, or `fps`.
+    std::string frame_times;
 };
 
 // The aggregate. Sub-option structs are held unchanged so that library callers

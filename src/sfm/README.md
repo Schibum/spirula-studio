@@ -658,6 +658,37 @@ exif:
     attitude: false
 ```
 
+**When a frame was shown.** A frame's time on the sensor clock is looked up,
+not computed from a rate (`frameTime` in `map/SensorGauge.h`, the one place
+every stage asks): a clip with a hole or a variable frame rate has no rate
+that fits, and timing it by the file's average rate bends the model while the
+scale still reports a small uncertainty. In this order:
+
+1. `frame_times: FILE` in the capture entry (`core/FrameTimes.h`): JSON,
+   `{"version": 1, "frames": N, "times": [...]}`, `times[n]` the presentation
+   time in seconds of source frame n, strictly increasing, the path relative
+   to the manifest. For frames that did not come from the telemetry file as it
+   is (a re-encoded or joined clip, a track delivered beside the video).
+2. `fps: RATE` in the capture entry: index over that rate. `fps` together with
+   `frame_times` is an error.
+3. The video's own sample times: `stts` plus `ctts`, shifted by the track's
+   edit list, in presentation order (`Telemetry::video_frame_times`). The
+   default. A CAMM track's edit list moves its samples the same way.
+4. The file's average rate, only when it has no usable sample table.
+
+`time_offset` is added to every time in each case. A frame whose index the
+table does not hold is untimed and counted, never extrapolated. Each stage
+that uses the track prints, per capture,
+`FILE: frame times from frame_times|video|rate, N frames, X ms off a constant rate at most`:
+X is the largest distance of any frame from the best constant rate.
+
+```yaml
+captures:
+  - prefix: ""
+    telemetry: clip.mp4
+    frame_times: frame_times.json
+```
+
 **The same sensors inside the reconstruction.** Everything above fixes the
 gauge of a finished model. With telemetry present the run also uses it while
 the model is built (`docs/notes/sensor-priors.md`), through one seam a

@@ -276,16 +276,16 @@ public:
         for (uint32_t i = 0; i < n; i++) {
             int best = -1;
             for (size_t c = 0; c < caps_.size(); c++) {
-                if (!caps_[c].timeline || !(caps_[c].fps > 0)) continue;
+                if (!caps_[c].timeline || !timesFrames(caps_[c])) continue;
                 if (!underPrefix(names[i], caps_[c].prefix)) continue;
                 if (best < 0 || caps_[c].prefix.size() > caps_[(size_t)best].prefix.size())
                     best = (int)c;
             }
-            const int idx = stemIndex(names[i]);
-            if (best < 0 || idx < 0) continue;
-            const SensorCapture& cap = caps_[(size_t)best];
+            if (best < 0 || !frameTime(caps_[(size_t)best], stemIndex(names[i]), t_[i])) {
+                t_[i] = 0.0;
+                continue;
+            }
             cap_[i] = best;
-            t_[i] = idx / cap.fps + 0.5 * cap.readout + cap.time_offset;
             const uint32_t cam = i < camera_ids.size() ? camera_ids[i] : 1;
             auto it = groups.find({best, cam});
             if (it == groups.end()) {
@@ -330,6 +330,8 @@ public:
         for (const auto& g : groups_) h.add(g.camera);
         for (const auto& c : caps_) {
             h.add(c.fps);
+            h.add(c.frame_times.size());
+            for (double ft : c.frame_times) h.add(ft);
             h.add(c.time_offset);
             h.add(c.readout);
             h.add(c.timeline ? c.timeline->rotationFingerprint() : uint64_t{0});

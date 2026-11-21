@@ -33,10 +33,14 @@ struct ManifestCamera {
 
 // One source video and the telemetry it carries. `telemetry` is the video
 // itself or a file the reader knows; frames under `prefix` are timed by the
-// source frame index in their stem over `fps` (0 = the file's own rate).
+// source frame index in their stem: by `frame_times`, a file listing when
+// each source frame was shown (core/FrameTimes.h; relative to the manifest),
+// else over `fps`, else by the video's own sample times (0 = the file's own).
+// `fps` and `frame_times` together are an error: two answers to one question.
 struct ManifestCapture {
     std::string prefix;
     std::string telemetry;
+    std::string frame_times;
     double fps = 0;
     double time_offset = 0;   // seconds added to every frame time
     bool imu = true, gps = true;   // false: that half of the file is ignored
