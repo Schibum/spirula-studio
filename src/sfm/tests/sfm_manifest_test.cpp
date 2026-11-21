@@ -14,6 +14,7 @@
 #include "data/Yaml.h"
 #include "sfm/Pipeline.h"
 #include "sfm/core/Exif.h"
+#include "sfm/core/FrameTimes.h"
 #include "sfm/core/Manifest.h"
 #include "sfm/core/Rig.h"
 #include "sfm/tests/TestMain.h"
@@ -265,6 +266,68 @@ static int cmdManifestTest(int, char**) {
         check(exifPrefixCovers({"drone"}, "drone/a.jpg") &&
                   !exifPrefixCovers({"drone"}, "drone2/a.jpg") && exifPrefixCovers({""}, "x.jpg"),
               "a prefix covers a folder, not a name it begins");
+
+        // A capture's frame-time file: read, written back, resolved against
+        // the manifest; `fps` beside it is refused.
+        write_file(dir + "/times.yaml",
+                   "captures:\n"
+                   "  - prefix: \"\"\n"
+                   "    telemetry: clip.mp4\n"
+                   "    frame_times: frame_times.json\n"
+                   "    time_offset: 0.01\n");
+        const Manifest ft = manifest_read(dir + "/times.yaml");
+        check(ft.captures.size() == 1 && ft.captures[0].frame_times == "frame_times.json" &&
+                  ft.captures[0].fps == 0 && ft.captures[0].time_offset == 0.01,
+              "a capture's frame_times file");
+        write_file(dir + "/times2.yaml", manifest_write(ft));
+        check(manifest_read(dir + "/times2.yaml").captures[0].frame_times == "frame_times.json" &&
+                  manifest_write(manifest_read(dir + "/times2.yaml")) == manifest_write(ft),
+              "frame_times survives a round trip");
+        SfmConfig fc;
+        std::string fd;
+        const std::filesystem::path ft_file(
+            manifest_apply(ft, fc, {}, fd).empty() && fc.telemetry_inputs.size() == 1
+                ? fc.telemetry_inputs[0].frame_times : std::string());
+        check(ft_file.filename() == "frame_times.json" &&
+                  ft_file.parent_path() ==
+                      std::filesystem::path(fc.telemetry_inputs[0].path).parent_path() &&
+                  fc.telemetry_inputs[0].time_offset == 0.01,
+              "frame_times reaches the config, resolved like the telemetry file");
+        check(sc.telemetry_inputs[0].frame_times.empty(), "no frame_times unless said");
+        write_file(dir + "/times_bad.yaml",
+                   "captures:\n"
+                   "  - telemetry: clip.mp4\n"
+                   "    fps: 30\n"
+                   "    frame_times: frame_times.json\n");
+        bool refused = false;
+        try {
+            manifest_read(dir + "/times_bad.yaml");
+        } catch (const std::exception& e) {
+            refused = std::string(e.what()).find("frame_times") != std::string::npos &&
+                      std::string(e.what()).find("fps") != std::string::npos;
+        }
+        check(refused, "fps together with frame_times is an error that names both");
+
+        // The file itself.
+        std::vector<double> times;
+        std::string terr;
+        write_file(dir + "/frame_times.json",
+                   "{\"version\": 1, \"video\": \"clip.mp4\", \"frames\": 4, "
+                   "\"times\": [0.0, 0.033333, 0.266667, 0.3]}");
+        check(frameTimesRead(dir + "/frame_times.json", times, terr) && times.size() == 4 &&
+                  times[2] == 0.266667,
+              "a frame-time file is read (" + terr + ")");
+        write_file(dir + "/frame_times_back.json",
+                   "{\"version\": 1, \"frames\": 3, \"times\": [0.0, 0.1, 0.1]}");
+        check(!frameTimesRead(dir + "/frame_times_back.json", times, terr) && times.empty() &&
+                  terr.find("frame_times_back.json") != std::string::npos &&
+                  terr.find("frame 2") != std::string::npos,
+              "times that do not increase are refused with the file and the index");
+        write_file(dir + "/frame_times_count.json",
+                   "{\"version\": 1, \"frames\": 5, \"times\": [0.0, 0.1]}");
+        check(!frameTimesRead(dir + "/frame_times_count.json", times, terr),
+              "a frame count that does not match is refused");
+        check(!frameTimesRead(dir + "/no_such_file.json", times, terr), "a missing file is refused");
 
         SfmConfig on = sc;
         on.telemetry_inputs[0].imu = true;

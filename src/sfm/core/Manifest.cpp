@@ -224,6 +224,12 @@ Manifest manifest_read(const std::string& path) {
                 if (v->type != JsonValue::Type::Number) bad(path, "time_offset: expected a number");
                 mc.time_offset = v->num;
             }
+            if (const JsonValue* v = c.find("frame_times")) {
+                mc.frame_times = str_of(*v, path, "frame_times");
+                if (!mc.frame_times.empty() && mc.fps > 0)
+                    bad(path, "captures: `fps` and `frame_times` both time the frames of " +
+                                  mc.telemetry + "; give one");
+            }
             mc.imu = flag_of(c, "imu", path, "captures");
             mc.gps = flag_of(c, "gps", path, "captures");
             m.captures.push_back(std::move(mc));
@@ -361,6 +367,7 @@ std::string manifest_write(const Manifest& m, bool json) {
             e.type = JsonValue::Type::Object;
             e.obj.emplace_back("prefix", text(c.prefix));
             e.obj.emplace_back("telemetry", text(c.telemetry));
+            if (!c.frame_times.empty()) e.obj.emplace_back("frame_times", text(c.frame_times));
             if (c.fps > 0) e.obj.emplace_back("fps", number(c.fps));
             if (c.time_offset != 0) e.obj.emplace_back("time_offset", number(c.time_offset));
             if (!c.imu) e.obj.emplace_back("imu", boolean(false));
@@ -438,7 +445,8 @@ std::string manifest_apply(const Manifest& m, SfmConfig& cfg,
     }
     for (const ManifestCapture& c : m.captures)
         cfg.telemetry_inputs.push_back(
-            {c.prefix, resolve(c.telemetry, base), c.fps, c.time_offset, c.imu, c.gps});
+            {c.prefix, resolve(c.telemetry, base), c.fps, c.time_offset, c.imu, c.gps,
+             c.frame_times.empty() ? std::string() : resolve(c.frame_times, base)});
     for (const ManifestExif& x : m.exif) {
         if (!x.gps) cfg.exif_gps_off.push_back(x.prefix);
         if (!x.attitude) cfg.exif_attitude_off.push_back(x.prefix);

@@ -67,6 +67,11 @@ struct Telemetry {
     VideoProjection projection;
     double video_duration = 0;   // seconds, from the movie header
     double video_fps = 0;        // first video track; 0 unknown
+    // When each frame of the first video track is shown, seconds on the
+    // movie's timeline, in presentation order (frame n is the n-th shown,
+    // the number a frame extractor names it by): sample times plus
+    // composition offsets, shifted by the track's edit list. Empty unknown.
+    std::vector<double> video_frame_times;
     double video_unix_start = 0; // 0 unknown
     double frame_readout = 0;    // rolling-shutter readout, seconds; 0 unknown
 

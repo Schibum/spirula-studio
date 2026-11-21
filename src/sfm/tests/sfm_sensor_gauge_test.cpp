@@ -264,6 +264,73 @@ int cmdSensorGaugeTest(int, char**) {
         check(!rr.r.up_from_imu && rr.r.groups[0].fit.reason == ExtrinsicFail::NoStream,
               "T8b no vertical declared, no up");
     }
+    // ---- T9: a clip with a hole, timed by a frame-time table ------------------
+    // Five source frames are missing after frame 20: every later frame's
+    // number is 5 lower than its time over the rate says. The table has the
+    // real times, so the gauge is what T2 finds; a rate alone is 208 ms off.
+    {
+        Scenario sc;
+        sc.gps = false;
+        const Vec3 axis{0.3, -1.2, 0.7};
+        Telemetry t = synthesize(sc, angleAxisToRotation(axis));
+        const TelemetryCheck c = telemetry_check(t);
+        SensorTimeline tl;
+        std::string err;
+        check(tl.init(t, c, err), "T9 timeline init: " + err);
+        Sim3 M;
+        M.scale = 0.37;
+        M.R = angleAxisToRotation(Vec3{1.1, 0.4, -0.9});
+        M.t = {2.0, -1.0, 0.5};
+        Reconstruction rec = synthesizeModel(sc, M);
+        const int hole_after = 20, missing = 5;
+        int last = 0;
+        for (auto& kv : rec.images) {
+            int n = sensor_detail::stemIndex(kv.second.name);
+            if (n > hole_after) n -= missing;
+            char name[64];
+            std::snprintf(name, sizeof name, "cam0/%05d.jpg", n);
+            kv.second.name = name;
+            last = std::max(last, n);
+        }
+        SensorCapture cap;
+        cap.prefix = "";
+        cap.fps = 24;
+        cap.timeline = &tl;
+        for (int n = 0; n <= last; n++)
+            cap.frame_times.push_back((n > hole_after ? n + missing : n) / 24.0);
+        double t0 = 0;
+        check(frameTime(cap, hole_after + 1, t0) && std::fabs(t0 - (hole_after + 1 + missing) / 24.0) < 1e-12,
+              "T9 a frame after the hole has its real time");
+        check(!frameTime(cap, last + 1, t0) && !frameTime(cap, -1, t0), "T9 no time outside the table");
+        SensorGaugeOptions opt;
+        opt.gps = false;
+        const SensorGaugeResult r = fitSensorGauge(rec, {cap}, opt);
+        std::printf("T9 table: applied=%d metric=%d scale_err=%.4f offset=%.1f ms timed=%d untimed=%d\n",
+                    r.applied, r.metric, r.T.scale / M.scale - 1.0, 1000 * r.time_offsets[0].offset,
+                    r.frames_timed, r.frames_untimed);
+        check(r.applied && r.metric && r.scale_from_imu, "T9 metric from IMU with the table");
+        check(std::fabs(r.T.scale / M.scale - 1.0) < 0.02, "T9 scale within 2%");
+        check(std::fabs(r.time_offsets[0].offset) < 0.005, "T9 no spurious clock offset");
+        check(r.frames_untimed == 0, "T9 every frame timed");
+
+        // The same frames by the rate alone: all after the hole are 208 ms early.
+        SensorCapture by_rate = cap;
+        by_rate.frame_times.clear();
+        const SensorGaugeResult rr = fitSensorGauge(rec, {by_rate}, opt);
+        std::printf("T9 rate:  applied=%d metric=%d scale_err=%.4f offset=%.1f ms found=%d\n",
+                    rr.applied, rr.metric, rr.T.scale / M.scale - 1.0, 1000 * rr.time_offsets[0].offset,
+                    (int)rr.time_offsets[0].found);
+        check(!rr.time_offsets[0].found || std::fabs(rr.time_offsets[0].offset) > 0.1 ||
+                  std::fabs(rr.T.scale / M.scale - 1.0) > 0.02 || !rr.metric,
+              "T9 the rate alone is visibly off");
+
+        // A table one frame short: that frame is untimed, not guessed.
+        SensorCapture short_table = cap;
+        short_table.frame_times.pop_back();
+        const SensorGaugeResult rs = fitSensorGauge(rec, {short_table}, opt);
+        check(rs.frames_untimed == 1 && rs.frames_timed == r.frames_timed - 1,
+              "T9 a frame past the table is counted as untimed");
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
