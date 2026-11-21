@@ -204,6 +204,19 @@ static void testMapperWalk(int device, bool verbose) {
     check(models.size() == 1, "the walk is one model");
     check(reg >= (uint32_t)(0.95 * w.gt.size()), "the walk registers");
     check(err >= 0 && err < 0.05, "the copy of the room is not folded onto the original");
+
+    // Every registration weak: each waits for the rest of its ranking and is refined before it
+    // triangulates, and none may be lost to that.
+    MapperOptions weak_opt = opt;
+    weak_opt.weak_pnp_ratio = 0.99;
+    Mapper weak(w.db, w.feats, weak_opt, {}, nullptr, &seqs);
+    std::vector<Reconstruction> weak_models = weak.run();
+    uint32_t reg_w = 0;
+    const double err_w = shapeError(weak_models.front(), w, reg_w);
+    printf("sequence-walk: every registration weak %u/%zu cameras in %zu model(s), shape error %.3f\n",
+           reg_w, w.gt.size(), weak_models.size(), err_w);
+    check(weak_models.size() == 1 && reg_w >= reg, "deferring weak registrations loses no camera");
+    check(err_w >= 0 && err_w < 0.05, "deferring weak registrations keeps the shape");
 }
 
 static int cmdSequenceTest(int argc, char** argv) {

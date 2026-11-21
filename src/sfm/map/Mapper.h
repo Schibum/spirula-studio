@@ -234,6 +234,11 @@ struct MapperOptions {
     // such sets. Speed comes from convergence-adaptive iterations + the
     // persistent solver instead (D38).
     double ba_growth_ratio = 1.1;      // COLMAP ba_global_images_ratio
+    // A registration whose final inliers are under this share of its visible pool is weak:
+    // it waits while a stronger candidate places (weak_mode bit 1), and a global BA runs before
+    // it triangulates (bit 2). 0 = off. SS_SFM_WEAK_PNP_PCT / SS_SFM_WEAK_MODE.
+    double weak_pnp_ratio = 0.0;
+    int weak_mode = 3;
     int ba_max_refinements = 5;        // final pass; growth passes use 2
     // LM cap of a final pass holding absolute centre factors: COLMAP's
     // ba_global_max_num_iterations. At 25, both final solves of a canopy drone capture under
@@ -397,6 +402,9 @@ public:
           priors_(priors && opt.use_priors ? priors : nullptr) {
         opt_.tracks.readExperiments();
         opt_.seed_essential = experimentInt("SFM_SEED_ESSENTIAL", opt_.seed_essential, 3);
+        opt_.weak_pnp_ratio =
+            experimentInt("SFM_WEAK_PNP_PCT", (int)std::lround(100 * opt_.weak_pnp_ratio), 100) / 100.0;
+        opt_.weak_mode = experimentInt("SFM_WEAK_MODE", opt_.weak_mode, 3);
     }
 
     const RigTable* rigs() const { return rigs_; }
@@ -2817,6 +2825,11 @@ private:
             if (seq_)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_sequence_summary,
                          {(long long)reg_near_won_, (long long)reg_vouched_});
+            if (opt_.weak_pnp_ratio > 0)
+                slog::diag(slog::Tag::Map,
+                           "[map] weak registrations (inlier share under %.2f): %u placed, "
+                           "%u global BA(s) before their triangulation",
+                           opt_.weak_pnp_ratio, weak_placed_, weak_ba_);
             if (priors_)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_prior_summary,
                          {(long long)prior_stats_.corrected, (long long)prior_stats_.refused,
@@ -2982,6 +2995,15 @@ private:
         checkedRefine(true);
     }
 
+    // Weak candidates of this ranking, retried in rank order once nothing stronger placed.
+    bool takeDeferred(std::vector<uint32_t>& cands) {
+        if (!defer_weak_ || weak_deferred_.empty()) return false;
+        defer_weak_ = false;
+        cands.insert(cands.end(), weak_deferred_.begin(), weak_deferred_.end());
+        weak_deferred_.clear();
+        return true;
+    }
+
     // The registration loop alone, returning how many images it brought in.
     // Split from grow() so a continuation pass can skip the final refinement
     // when it registered nothing -- refining a model that did not change is
@@ -3040,7 +3062,10 @@ private:
             }
             if (cands.empty()) break;
             bool registered = false;
-            for (uint32_t img : cands) {
+            weak_deferred_.clear();
+            defer_weak_ = opt_.weak_pnp_ratio > 0 && (opt_.weak_mode & 1);
+            for (size_t ci = 0; ci < cands.size() || takeDeferred(cands); ci++) {
+                const uint32_t img = cands[ci];
                 reg_trials_[img]++;
                 g_map_prof.n_reg_try++;
                 bool ok;
@@ -3052,11 +3077,22 @@ private:
                     g_map_prof.n_reg_ok++;
                     registered = true;
                     registered_here++;
+                    // A weak pose's triangulations set the scale the next frames register on.
+                    const bool weak_ba =
+                        std::exchange(weak_reg_, false) && (opt_.weak_mode & 2) && !stop_at_ba;
+                    if (weak_ba) {
+                        weak_ba_++;
+                        recent_regs_.push_back(img);   // the collapse check may undo it
+                        checkedRefine(false);
+                        rebuildScores();
+                        next_ba = std::ceil(rec_.numRegistered() * opt_.ba_growth_ratio);
+                        if (!rec_.images.at(img).registered) break;
+                    }
                     {
                         ProfTimer pt(g_map_prof.tri);
                         triangulateForImage(img);
                     }
-                    recent_regs_.push_back(img);
+                    if (!weak_ba) recent_regs_.push_back(img);
                     gps_regs_since_ba_++;
                     gpsScaleCheck(img);
                     registered_here += completeFrameOf(img) + frame_regs_;
@@ -4591,6 +4627,14 @@ private:
             seqDump(img, X, nearf, r, rival, "refused (ratio after refinement)");
             return false;
         }
+        // A swept focal is already committed to the camera, so that pose is not deferred.
+        const bool weak = (double)r.num_inliers < opt_.weak_pnp_ratio * (double)pool;
+        if (weak && defer_weak_ && swept_f == 0) {
+            reg_trials_[img]--;
+            weak_deferred_.push_back(img);
+            seqDump(img, X, nearf, r, rival, "deferred (weak)");
+            return false;
+        }
         if (!levelCheck(img, r.pose)) return false;
         if (!gpsCheck(img, r.pose)) return false;
         if (!ratioOk(r.num_inliers, pool) && reg_vouched_ == vouched_before) reg_fail_.strong++;
@@ -4598,6 +4642,8 @@ private:
                                                                         : "placed");
         if (pool < X.size()) reg_fail_.occluded += (uint32_t)(X.size() - pool);
         focal_known_.insert(cid);
+        weak_reg_ = weak;
+        weak_placed_ += weak ? 1 : 0;
 
         commitPose(img, r.pose, feat, pid, r.inlier_mask, r.num_inliers, X.size());
         return true;
@@ -6225,6 +6271,10 @@ private:
     std::vector<int> near_score_;                      // per image, features with near support
     uint32_t reg_vouched_ = 0;   // registrations the neighbours carried past the pool's ratio
     uint32_t reg_near_won_ = 0;  // ... where the neighbours' pose beat the whole pool's
+    std::vector<uint32_t> weak_deferred_;  // MapperOptions::weak_pnp_ratio
+    bool defer_weak_ = false;
+    bool weak_reg_ = false;
+    uint32_t weak_placed_ = 0, weak_ba_ = 0;
     int seed_phase_ = 0;         // 0: seed among neighbour pairs, 1: among every pair
     uint32_t reg_by_rig_ = 0;         // registrations the rig placed, summed over the run
     uint32_t reg_rig_word_ = 0;       // ... of them with no inlier of their own
