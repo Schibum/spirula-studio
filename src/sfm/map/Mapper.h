@@ -234,6 +234,20 @@ struct MapperOptions {
     // such sets. Speed comes from convergence-adaptive iterations + the
     // persistent solver instead (D38).
     double ba_growth_ratio = 1.1;      // COLMAP ba_global_images_ratio
+    // Local BA after every registration (0 = off; Mapper::localRefine): the new image and its
+    // local_ba - 1 best-connected neighbours free, their points free, the rest held. COLMAP's
+    // ba_local_num_images (6). SS_SFM_LOCAL_BA.
+    int local_ba = 0;
+    int local_ba_ring = 40;
+    int local_ba_iters = 10;
+    // PnP point quarantine (0 = off; Mapper::quarantinePool): PnP and its ratio gate skip points
+    // under quarantine_deg or quarantine_views views (whole pool when under 30 qualify).
+    // SS_SFM_QUARANTINE_DEG / SS_SFM_QUARANTINE_VIEWS.
+    double quarantine_deg = 0.0;
+    int quarantine_views = 3;
+    // The sequence frontier's order (chooseNextImages): false = nearest to the model first
+    // (D79), true = best-supported first (visibility pyramid). SS_SFM_NEXT=support.
+    bool next_by_support = false;
     int ba_max_refinements = 5;        // final pass; growth passes use 2
     // LM cap of a final pass holding absolute centre factors: COLMAP's
     // ba_global_max_num_iterations. At 25, both final solves of a canopy drone capture under
@@ -397,7 +411,28 @@ public:
           priors_(priors && opt.use_priors ? priors : nullptr) {
         opt_.tracks.readExperiments();
         opt_.seed_essential = experimentInt("SFM_SEED_ESSENTIAL", opt_.seed_essential, 3);
+        opt_.local_ba = experimentInt("SFM_LOCAL_BA", opt_.local_ba, 1000);
+        opt_.quarantine_deg = experimentDouble("SFM_QUARANTINE_DEG", opt_.quarantine_deg, 90.0);
+        opt_.quarantine_views = experimentInt("SFM_QUARANTINE_VIEWS", opt_.quarantine_views, 1000);
+        if (const char* next = spirula::env("SFM_NEXT")) {
+            const std::string v = next;
+            if (v != "support" && v != "near") throw std::invalid_argument("invalid SS_SFM_NEXT");
+            opt_.next_by_support = v == "support";
+        }
     }
+
+    // What the local bundle adjustment, the PnP quarantine and the support-first ranking did
+    // over this run (MapperOptions::local_ba, quarantine_deg, next_by_support).
+    struct GuardStats {
+        uint32_t local_runs = 0, local_skipped = 0, local_failed = 0;
+        uint64_t local_free = 0, local_held = 0, local_points = 0, local_obs = 0;
+        uint64_t local_filtered_obs = 0, local_filtered_pts = 0, local_iters = 0;
+        double local_seconds = 0;
+        uint32_t q_attempts = 0, q_filtered = 0, q_fallback = 0;
+        uint64_t q_pool = 0, q_excluded = 0;
+        uint32_t next_rankings = 0, next_changed = 0;
+    };
+    const GuardStats& guardStats() const { return guard_; }
 
     const RigTable* rigs() const { return rigs_; }
     const SequenceTable* sequences() const { return seq_; }
@@ -2817,6 +2852,31 @@ private:
             if (seq_)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_sequence_summary,
                          {(long long)reg_near_won_, (long long)reg_vouched_});
+            if (opt_.local_ba > 0) {
+                const double n = std::max<uint32_t>(1, guard_.local_runs);
+                slog::diag(slog::Tag::Map,
+                           "[map] local BA (%d images): %u run(s), %u skipped, %u failed; per run "
+                           "%.1f free + %.1f held images, %.0f points, %.0f observations, %.1f LM "
+                           "iterations; filtered %llu observation(s), %llu point(s); %.2f s in all",
+                           opt_.local_ba, guard_.local_runs, guard_.local_skipped,
+                           guard_.local_failed, guard_.local_free / n, guard_.local_held / n,
+                           guard_.local_points / n, guard_.local_obs / n, guard_.local_iters / n,
+                           (unsigned long long)guard_.local_filtered_obs,
+                           (unsigned long long)guard_.local_filtered_pts, guard_.local_seconds);
+            }
+            if (opt_.quarantine_deg > 0)
+                slog::diag(slog::Tag::Map,
+                           "[map] PnP quarantine (>= %.2f deg, >= %d views): %u registration "
+                           "attempt(s), %u with points quarantined (%.1f %% of their pools), %u of "
+                           "them on the whole pool (under %d qualified)",
+                           opt_.quarantine_deg, opt_.quarantine_views, guard_.q_attempts,
+                           guard_.q_filtered,
+                           guard_.q_pool ? 100.0 * (double)guard_.q_excluded / (double)guard_.q_pool : 0.0,
+                           guard_.q_fallback, kQuarantineMinPool);
+            if (opt_.next_by_support)
+                slog::diag(slog::Tag::Map,
+                           "[map] next view best-supported first: %u ranking(s), %u led by another "
+                           "image than nearest-first", guard_.next_rankings, guard_.next_changed);
             if (priors_)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_prior_summary,
                          {(long long)prior_stats_.corrected, (long long)prior_stats_.refused,
@@ -3056,6 +3116,7 @@ private:
                         ProfTimer pt(g_map_prof.tri);
                         triangulateForImage(img);
                     }
+                    if (opt_.local_ba > 0) localRefine(img);
                     recent_regs_.push_back(img);
                     gps_regs_since_ba_++;
                     gpsScaleCheck(img);
@@ -4209,6 +4270,27 @@ private:
         pyramid_score_[img] += score;
     }
 
+    // pyramidSet's inverse, for detachObservation.
+    void pyramidUnset(uint32_t img, uint32_t f) {
+        const FeatureSet& fs = feats_[img];
+        if (fs.width <= 0 || fs.height <= 0) return;
+        const Keypoint& k = fs.keypoints[f];
+        int cx = (int)(kPyrDim * (double)k.x / fs.width);
+        int cy = (int)(kPyrDim * (double)k.y / fs.height);
+        cx = std::min(std::max(cx, 0), kPyrDim - 1);
+        cy = std::min(std::max(cy, 0), kPyrDim - 1);
+        uint16_t* level = pyramid_[img].data() + kPyrCells;
+        uint32_t score = 0;
+        for (int i = kPyrLevels - 1; i >= 0; i--) {
+            const int dim = 2 << i;
+            level -= (size_t)dim * dim;
+            if (--level[(size_t)cy * dim + cx] == 0) score += (uint32_t)dim * dim;
+            cx >>= 1;
+            cy >>= 1;
+        }
+        pyramid_score_[img] -= score;
+    }
+
     // Candidates for the next registration, best first: unregistered, still
     // within their trial budget, and seeing at least min_num_pnp_inliers
     // triangulated points. The gate is the correspondence count; the *order* is
@@ -4237,6 +4319,8 @@ private:
             return opt_.sequence_window + 1;
         };
         std::vector<std::pair<uint64_t, uint32_t>> ranked;
+        // SS_SFM_NEXT=support: the first candidate nearest-first would have taken, to count.
+        std::pair<uint64_t, uint32_t> nearest_first{0, UINT32_MAX};
         for (uint32_t i = 0; i < db_.images.size(); i++) {
             if (rec_.images.at(i).registered) continue;
             if (reg_trials_[i] >= opt_.max_reg_trials || !allowed(i)) continue;
@@ -4259,7 +4343,15 @@ private:
             if (nearReady(i)) {
                 const uint64_t closeness = (uint64_t)std::min(
                     65535, std::max(0, opt_.sequence_window + 1 - frontier(i)));
-                rank |= (1ull << 49) | (closeness << 32);
+                // Best-supported first: the frontier ranked by the pyramid score alone.
+                if (opt_.next_by_support) {
+                    const uint64_t nf = rank | (1ull << 49) | (closeness << 32);
+                    if (nearest_first.second == UINT32_MAX || nf > nearest_first.first)
+                        nearest_first = {nf, i};
+                    rank |= 1ull << 49;
+                } else {
+                    rank |= (1ull << 49) | (closeness << 32);
+                }
             }
             ranked.emplace_back(rank, i);
         }
@@ -4270,6 +4362,10 @@ private:
         std::vector<uint32_t> out;
         out.reserve(ranked.size());
         for (const auto& r : ranked) out.push_back(r.second);
+        if (opt_.next_by_support && nearest_first.second != UINT32_MAX) {
+            guard_.next_rankings++;
+            if (out.front() != nearest_first.second) guard_.next_changed++;
+        }
         return out;
     }
 
@@ -4490,6 +4586,12 @@ private:
         std::vector<char> nearf;
         gatherCorrespondences(img, X, br, feat, pid, seq_ ? &nearf : nullptr);
         if ((int)X.size() < opt_.min_num_pnp_inliers) { reg_fail_.few_corr++; return false; }
+        // The whole pool, when PnP and its gates below run on the matured points only.
+        std::vector<Vec3> X_all;
+        std::vector<uint32_t> feat_all;
+        std::vector<uint64_t> pid_all;
+        const bool quarantined = opt_.quarantine_deg > 0 &&
+                                 quarantinePool(X, br, feat, pid, nearf, X_all, feat_all, pid_all);
 
         const uint32_t cid = rec_.images[img].camera_id;
         PnPResult r;
@@ -4599,8 +4701,232 @@ private:
         if (pool < X.size()) reg_fail_.occluded += (uint32_t)(X.size() - pool);
         focal_known_.insert(cid);
 
+        if (quarantined) {
+            // Found and judged on the matured points, the pose observes the whole pool.
+            X.swap(X_all);
+            feat.swap(feat_all);
+            pid.swap(pid_all);
+            br.resize(feat.size());
+            for (size_t k = 0; k < feat.size(); k++) br[k] = bearing(img, feat[k]);
+            classify(img, X, br, r);
+        }
         commitPose(img, r.pose, feat, pid, r.inlier_mask, r.num_inliers, X.size());
         return true;
+    }
+
+    // ---- PnP point quarantine (MapperOptions::quarantine_deg) --------------
+    // Two views at a small angle fix a point's depth poorly, and a pose found on such points is
+    // confidently wrong in translation. The accepted pose observes them, so they mature.
+    static constexpr int kQuarantineMinPool = 30;
+
+    // Moves the whole pool to *_all and keeps the matured points; false (pool unchanged)
+    // when every point qualifies or fewer than kQuarantineMinPool do.
+    bool quarantinePool(std::vector<Vec3>& X, std::vector<Vec3>& br, std::vector<uint32_t>& feat,
+                        std::vector<uint64_t>& pid, std::vector<char>& nearf,
+                        std::vector<Vec3>& X_all, std::vector<uint32_t>& feat_all,
+                        std::vector<uint64_t>& pid_all) {
+        const double min_ang = opt_.quarantine_deg * M_PI / 180.0;
+        constexpr size_t kMaxScan = 16;  // views per track, strided, both ends kept
+        std::unordered_map<uint32_t, Vec3> centers;
+        auto center = [&](uint32_t i) -> const Vec3& {
+            auto it = centers.find(i);
+            if (it == centers.end())
+                it = centers.emplace(i, cameraCenter(rec_.images.at(i).pose)).first;
+            return it->second;
+        };
+        std::vector<char> keep(X.size(), 0);
+        std::vector<uint32_t> imgs;
+        size_t n = 0;
+        for (size_t k = 0; k < X.size(); k++) {
+            const std::vector<TrackElement>& t = rec_.points3D.at(pid[k]).track;
+            if ((int)t.size() < opt_.quarantine_views) continue;
+            imgs.clear();
+            const size_t stride = std::max<size_t>(1, t.size() / kMaxScan);
+            for (size_t i = 0; i < t.size(); i += stride) imgs.push_back(t[i].image_id);
+            if (imgs.back() != t.back().image_id) imgs.push_back(t.back().image_id);
+            bool ok = false;
+            for (size_t i = 0; i + 1 < imgs.size() && !ok; i++)
+                for (size_t j = i + 1; j < imgs.size() && !ok; j++)
+                    ok = triangulationAngle(X[k], center(imgs[i]), center(imgs[j])) >= min_ang;
+            keep[k] = ok ? 1 : 0;
+            n += ok ? 1 : 0;
+        }
+        guard_.q_attempts++;
+        if (n == X.size()) return false;
+        guard_.q_filtered++;
+        guard_.q_pool += X.size();
+        guard_.q_excluded += X.size() - n;
+        if ((int)n < kQuarantineMinPool) {
+            guard_.q_fallback++;
+            return false;
+        }
+        X_all = X;
+        feat_all = feat;
+        pid_all = pid;
+        size_t w = 0;
+        for (size_t k = 0; k < X.size(); k++) {
+            if (!keep[k]) continue;
+            X[w] = X[k];
+            br[w] = br[k];
+            feat[w] = feat[k];
+            pid[w] = pid[k];
+            if (!nearf.empty()) nearf[w] = nearf[k];
+            w++;
+        }
+        X.resize(w);
+        br.resize(w);
+        feat.resize(w);
+        pid.resize(w);
+        if (!nearf.empty()) nearf.resize(w);
+        return true;
+    }
+
+    // ---- local bundle adjustment (MapperOptions::local_ba) ----------------
+    // Global BA runs only at 10 % growth; until then a registration's error is built on. The
+    // held ring is the local_ba_ring images seeing the local points most; intrinsics are held.
+    void localRefine(uint32_t img) {
+        if (rigs_) { guard_.local_skipped++; return; }  // frames move as one: not here
+        const auto t0 = std::chrono::steady_clock::now();
+        // The free set: img and the registered images sharing the most points with it.
+        std::unordered_map<uint32_t, uint32_t> shared;
+        for (uint64_t id : rec_.images.at(img).point3D_ids) {
+            if (id == kInvalidPoint3D) continue;
+            for (const TrackElement& e : rec_.points3D.at(id).track)
+                if (e.image_id != img) shared[e.image_id]++;
+        }
+        auto byCount = [](std::unordered_map<uint32_t, uint32_t>& m, size_t n) {
+            std::vector<std::pair<uint32_t, uint32_t>> v(m.begin(), m.end());
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+                return a.second != b.second ? a.second > b.second : a.first < b.first;
+            });
+            if (v.size() > n) v.resize(n);
+            return v;
+        };
+        std::unordered_set<uint32_t> free{img};
+        for (const auto& kv : byCount(shared, (size_t)opt_.local_ba - 1)) free.insert(kv.first);
+        // Every point the free images observe, and the held ring: the other images observing
+        // them, the most connected local_ba_ring (bounds the solve; the rest's views drop out).
+        std::vector<uint64_t> pts;
+        std::unordered_set<uint64_t> seen;
+        for (uint32_t i : free)
+            for (uint64_t id : rec_.images.at(i).point3D_ids)
+                if (id != kInvalidPoint3D && seen.insert(id).second) pts.push_back(id);
+        std::sort(pts.begin(), pts.end());
+        std::unordered_map<uint32_t, uint32_t> ring_obs;
+        for (uint64_t id : pts)
+            for (const TrackElement& e : rec_.points3D.at(id).track)
+                if (!free.count(e.image_id)) ring_obs[e.image_id]++;
+        std::unordered_set<uint32_t> held;
+        for (const auto& kv : byCount(ring_obs, (size_t)opt_.local_ba_ring)) held.insert(kv.first);
+
+        Reconstruction sub;
+        sub.cameras = rec_.cameras;
+        for (const std::unordered_set<uint32_t>* set : {&free, &held})
+            for (uint32_t i : *set) sub.images.emplace(i, rec_.images.at(i));
+        for (uint64_t id : pts) {
+            Point3D p = rec_.points3D.at(id);
+            p.track.erase(std::remove_if(p.track.begin(), p.track.end(),
+                                         [&](const TrackElement& e) { return !sub.images.count(e.image_id); }),
+                          p.track.end());
+            if (p.track.size() >= 2) sub.points3D.emplace(id, std::move(p));
+        }
+        BundleOptions bo;
+        bo.real = RealCfg::CPU;
+        bo.threads = opt_.threads;
+        bo.loss = opt_.ba_loss;
+        bo.loss_param = (float)(opt_.ba_loss_param * medianPixelScale());
+        bo.refine_intrinsics = false;
+        bo.use_rigs = false;
+        bo.solver = "dense";
+        bo.max_iters = opt_.local_ba_iters;
+        bo.rtol = opt_.ba_growth_rtol;
+        bo.patience = opt_.ba_growth_patience;
+        BundleLayout L = buildBundle(sub, bo);
+        if (L.P.num_images < 2) { guard_.local_skipped++; return; }
+        std::unordered_set<const Image*> free_at;
+        for (uint32_t i : free) free_at.insert(&sub.images.at(i));
+        L.P.frame_fixed.assign(L.P.num_frames, 0);
+        for (uint32_t i = 0; i < L.P.num_images; i++)
+            L.P.frame_fixed[L.P.image_frame[i]] = free_at.count(L.imgOf[i]) ? 0 : 1;
+        BundleRun run;
+        try {
+            run = solveBundle(L.P, bundleSolverOptions(bo), nullptr);
+        } catch (const Cancelled&) {
+            throw;
+        } catch (const std::exception& e) {
+            guard_.local_failed++;  // the model is untouched: nothing was written back
+            if (opt_.verbose)
+                slog::diag(slog::Tag::Map, "[map] local BA failed: %s", e.what());
+            return;
+        }
+        writeBundle(sub, L, L.P);
+        for (uint32_t i : free) rec_.images.at(i).pose = sub.images.at(i).pose;
+        for (const auto& kv : sub.points3D) rec_.points3D.at(kv.first).xyz = kv.second.xyz;
+        guard_.local_runs++;
+        guard_.local_free += free.size();
+        guard_.local_held += L.P.num_images - free.size();
+        guard_.local_points += L.P.num_points;
+        guard_.local_obs += L.P.num_obs;
+        guard_.local_iters += (uint64_t)run.stats.iterations;
+        localFilter(pts);
+        guard_.local_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // filterPoints' two tests over the local points alone: observations that now reproject
+    // badly, and tracks left without two views or without a view pair at min_tri_angle.
+    void localFilter(const std::vector<uint64_t>& pts) {
+        const double min_ang = opt_.min_tri_angle_deg * M_PI / 180.0;
+        for (uint64_t id : pts) {
+            auto it = rec_.points3D.find(id);
+            if (it == rec_.points3D.end()) continue;
+            Point3D& pt = it->second;
+            size_t keep = 0;
+            for (size_t r = 0; r < pt.track.size(); r++) {
+                const TrackElement el = pt.track[r];
+                if (reprojErr(el.image_id, el.point2D_idx, pt.xyz) <= errPx(el.image_id)) {
+                    pt.track[keep++] = el;
+                } else {
+                    detachObservation(el.image_id, el.point2D_idx);
+                    guard_.local_filtered_obs++;
+                }
+            }
+            pt.track.resize(keep);
+            bool degenerate = pt.track.size() < 2;
+            if (!degenerate) {
+                double best = 0;
+                for (size_t i = 0; i + 1 < pt.track.size() && best < min_ang; i++)
+                    for (size_t j = i + 1; j < pt.track.size() && best < min_ang; j++)
+                        best = std::max(best, triangulationAngle(
+                                                  pt.xyz,
+                                                  cameraCenter(rec_.images.at(pt.track[i].image_id).pose),
+                                                  cameraCenter(rec_.images.at(pt.track[j].image_id).pose)));
+                degenerate = best < min_ang;
+            }
+            if (!degenerate) continue;
+            for (const TrackElement& el : pt.track) {
+                detachObservation(el.image_id, el.point2D_idx);
+                guard_.local_filtered_obs++;
+            }
+            rec_.points3D.erase(it);
+            guard_.local_filtered_pts++;
+        }
+    }
+
+    // attachObservation's inverse: feature f of registered image img leaves its 3D point.
+    void detachObservation(uint32_t img, uint32_t f) {
+        rec_.images.at(img).point3D_ids[f] = kInvalidPoint3D;
+        for (const Correspondence& c : graph_.at(img, f)) {
+            uint16_t& n = support_[c.image_id][c.feature_idx];
+            if (n && --n == 0) {
+                score_cache_[c.image_id]--;
+                pyramidUnset(c.image_id, c.feature_idx);
+            }
+            if (seq_ && nearby(img, c.image_id)) {
+                uint16_t& m = near_support_[c.image_id][c.feature_idx];
+                if (m && --m == 0) near_score_[c.image_id]--;
+            }
+        }
     }
 
     // ---- rigs -------------------------------------------------------------
@@ -6225,6 +6551,7 @@ private:
     std::vector<int> near_score_;                      // per image, features with near support
     uint32_t reg_vouched_ = 0;   // registrations the neighbours carried past the pool's ratio
     uint32_t reg_near_won_ = 0;  // ... where the neighbours' pose beat the whole pool's
+    mutable GuardStats guard_;   // local BA, quarantine, support-first ranking (chooseNextImages is const)
     int seed_phase_ = 0;         // 0: seed among neighbour pairs, 1: among every pair
     uint32_t reg_by_rig_ = 0;         // registrations the rig placed, summed over the run
     uint32_t reg_rig_word_ = 0;       // ... of them with no inlier of their own

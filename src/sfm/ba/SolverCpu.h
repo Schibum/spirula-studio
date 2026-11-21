@@ -690,8 +690,9 @@ private:
                             for (int row = 0; row < 2; row++) {
                                 const double* src = jcf + row * DOF;
                                 double* dst = jc + row * dofw;
+                                const bool held = !P_.frame_fixed.empty() && P_.frame_fixed[frame_[img]];
                                 for (uint32_t a = 0; a < 6; a++)
-                                    dst[a] = opt_.fix_rotations && a < 3 ? 0 : src[a] * sw;
+                                    dst[a] = held || (opt_.fix_rotations && a < 3) ? 0 : src[a] * sw;
                                 for (uint32_t i = 0, k = 6; i < 6; i++)
                                     if ((emask >> i) & 1u) dst[k++] = src[6 + i] * sw;
                                 for (uint32_t i = 0; i < gz; i++)

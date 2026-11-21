@@ -67,6 +67,9 @@ struct BAProblem {
     // checks), which is what lets the host solver own a frame's rows per task.
     uint32_t num_frames = 0;
     std::vector<uint32_t> image_frame;    // per image
+    // Per frame, 1 = held where it is (its pose columns get no Jacobian): a local bundle
+    // adjustment's fixed ring. Empty = every frame free. Host solver only (BundleSolver::init).
+    std::vector<uint8_t> frame_fixed;
     std::vector<uint32_t> image_member;   // per image; kNoMember = no extrinsic
     struct Member {
         uint32_t ext_offset;  // into `exts` (6 entries)

@@ -155,6 +155,8 @@ public:
                 opt_.real = real;
             }
         }
+        // Held frames (BAProblem::frame_fixed) exist on the host path only.
+        if (!P_.frame_fixed.empty()) opt_.real = RealCfg::CPU;
         if (opt_.real == RealCfg::CPU) {
             cpu_.reset(new bacpu::Solver(P_, opt_));
             cpu_->init();
