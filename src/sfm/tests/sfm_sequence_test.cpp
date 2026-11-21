@@ -378,6 +378,246 @@ static void testTrace(int device) {
     check(threw, "an invalid SS_SFM_TRACE_IMAGES is refused");
     fs::remove_all(root);
 }
+
+// SS_SFM_TIE_MERGE: a wall seen by 20 cameras, cut between 9 and 10. The model holds the
+// block 10-19 at twice its scale about camera 10, with its own copy of every point both
+// sides see; only points seen by 9 and 10 alone are shared. Verified matches tie the copies.
+struct TieScene {
+    Walk w;
+    std::vector<Vec3> X;       // per feature, the true point
+    std::vector<uint8_t> dup;  // per feature: seen twice or more on each side
+};
+
+static TieScene makeTieScene() {
+    TieScene s;
+    Walk& w = s.w;
+    const int NP = 500, NL = 40, M = 20;
+    Camera K = Camera::defaultFor(1, w.W, w.H, w.focal);
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<double> ux(4.0, 8.0), uy(-3.5, 3.5), uz(-2.0, 11.5);
+    std::normal_distribution<double> noise(0.0, 0.3);
+    std::vector<Vec3>& X = s.X;
+    X.resize(NP + NL);
+    for (int p = 0; p < NP; p++) X[p] = {ux(rng), uy(rng), uz(rng)};
+    std::uniform_real_distribution<double> ul(3.5, 6.0);
+    for (int p = NP; p < NP + NL; p++) X[p] = {ux(rng), uy(rng), ul(rng)};
+    for (int c = 0; c < M; c++) w.gt.push_back(lookAtX({0, 0, 0.5 * c}));
+    w.feats.resize(M);
+    w.names.resize(M);
+    std::vector<std::vector<char>> vis(M, std::vector<char>(NP + NL, 0));
+    for (int c = 0; c < M; c++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "%03d", c);
+        w.names[c] = nm;
+        FeatureSet& fs = w.feats[c];
+        fs.width = w.W;
+        fs.height = w.H;
+        fs.keypoints.assign(NP + NL, {-1000, -1000, 2, 0, 0});
+        for (int p = 0; p < NP + NL; p++) {
+            if (p >= NP && c != 9 && c != 10) continue;
+            Vec3 pc = mul(w.gt[c].R, X[p]) + w.gt[c].t;
+            Vec2 px = K.project(pc);
+            if (pc.z > 0.1 && px.x > 0 && px.x < w.W && px.y > 0 && px.y < w.H) {
+                fs.keypoints[p] = {(float)(px.x + noise(rng)), (float)(px.y + noise(rng)), 2, 0, 0};
+                vis[c][p] = 1;
+            }
+        }
+    }
+    w.db.images.resize(M);
+    for (int c = 0; c < M; c++) w.db.images[c] = {w.names[c], (uint32_t)(NP + NL)};
+    for (int i = 0; i < M; i++)
+        for (int j = i + 1; j < M; j++) {
+            TwoViewMatches tv;
+            tv.image1 = i;
+            tv.image2 = j;
+            tv.config = (int)TwoViewConfig::Uncalibrated;
+            for (int p = 0; p < NP + NL; p++)
+                if (vis[i][p] && vis[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p});
+            if (tv.matches.size() >= 15) w.db.pairs.push_back(std::move(tv));
+        }
+    s.dup.assign(NP + NL, 0);
+    for (int p = 0; p < NP; p++) {
+        int pre = 0, blk = 0;
+        for (int c = 0; c < M; c++) (c < 10 ? pre : blk) += vis[c][p];
+        s.dup[p] = pre >= 2 && blk >= 2;
+    }
+    return s;
+}
+
+// `base` (any model of the scene with every image registered) with the true poses, the
+// block scaled about camera 10, and each side's points triangulated where that side has them.
+static Reconstruction splitModel(const TieScene& s, const Reconstruction& base, double scale) {
+    const Walk& w = s.w;
+    Reconstruction m = base;
+    const Vec3 pivot = cameraCenter(w.gt[10]);
+    for (auto& kv : m.cameras) {
+        Camera K = Camera::defaultFor(1, w.W, w.H, w.focal);
+        K.id = kv.first;
+        kv.second = K;
+    }
+    for (auto& kv : m.images) {
+        Pose p = w.gt[kv.first];
+        if (kv.first >= 10) {
+            const Vec3 c = pivot + (cameraCenter(p) - pivot) * scale;
+            const Vec3 t = mul(p.R, c);
+            p.t = {-t.x, -t.y, -t.z};
+        }
+        kv.second.pose = p;
+        std::fill(kv.second.point3D_ids.begin(), kv.second.point3D_ids.end(), kInvalidPoint3D);
+    }
+    m.points3D.clear();
+    m.next_point3D_id = 1;
+    for (uint32_t p = 0; p < (uint32_t)s.X.size(); p++)
+        for (int side = 0; side < 2; side++) {
+            std::vector<TrackElement> tr;
+            for (uint32_t c = side ? 10 : 0; c < (side ? 20u : 10u); c++)
+                if (w.feats[c].keypoints[p].x >= 0) tr.push_back({c, p});
+            if (tr.size() < 2) continue;
+            m.addPoint3D(side ? pivot + (s.X[p] - pivot) * scale : s.X[p], tr);
+        }
+    return m;
+}
+
+// Copies of one scene point that end up as one point id.
+static size_t joinedCopies(const TieScene& s, const Reconstruction& m) {
+    size_t n = 0;
+    auto idOf = [&](uint32_t c, uint32_t p) {
+        auto it = m.images.find(c);
+        return it == m.images.end() || !it->second.registered ? kInvalidPoint3D
+                                                               : it->second.point3D_ids[p];
+    };
+    for (uint32_t p = 0; p < (uint32_t)s.dup.size(); p++) {
+        if (!s.dup[p]) continue;
+        std::vector<uint64_t> pre;
+        for (uint32_t c = 0; c < 10; c++)
+            if (idOf(c, p) != kInvalidPoint3D) pre.push_back(idOf(c, p));
+        bool joined = false;
+        for (uint32_t c = 10; c < 20 && !joined; c++)
+            joined = idOf(c, p) != kInvalidPoint3D &&
+                     std::find(pre.begin(), pre.end(), idOf(c, p)) != pre.end();
+        n += joined;
+    }
+    return n;
+}
+
+// Median camera step over 11-19 over the median over 1-9: 1 is one scale.
+static double blockRatio(const Reconstruction& m) {
+    auto steps = [&](uint32_t lo, uint32_t hi) {
+        std::vector<double> v;
+        for (uint32_t c = lo; c <= hi; c++) {
+            auto a = m.images.find(c - 1), b = m.images.find(c);
+            if (a == m.images.end() || b == m.images.end() || !a->second.registered ||
+                !b->second.registered)
+                continue;
+            v.push_back((cameraCenter(a->second.pose) - cameraCenter(b->second.pose)).norm());
+        }
+        std::sort(v.begin(), v.end());
+        return v.empty() ? 0.0 : v[v.size() / 2];
+    };
+    const double pre = steps(1, 9);
+    return pre > 0 ? steps(11, 19) / pre : -1;
+}
+
+static void setTieEnv(const char* n, const char* keep, const char* near_d) {
+    const char* names[] = {"SS_SFM_TIE_MERGE", "SS_SFM_TIE_KEEP", "SS_SFM_TIE_NEAR"};
+    const char* vals[] = {n, keep, near_d};
+    for (int i = 0; i < 3; i++) {
+        if (vals[i]) setenv(names[i], vals[i], 1);
+        else unsetenv(names[i]);
+    }
+}
+
+static Reconstruction tieRefine(const TieScene& s, const Reconstruction& split,
+                                const MapperOptions& opt, const char* n, const char* keep,
+                                const char* near_d = nullptr) {
+    setTieEnv(n, keep, near_d);
+    Reconstruction out;
+    {
+        Mapper m(s.w.db, s.w.feats, opt);
+        out = m.refine(split);
+    }
+    setTieEnv(nullptr, nullptr, nullptr);
+    return out;
+}
+
+static void testTieMerge(int device) {
+    TieScene s = makeTieScene();
+    MapperOptions opt;
+    opt.focal = s.w.focal;
+    opt.device = device;
+    setTieEnv(nullptr, nullptr, nullptr);
+    std::vector<Reconstruction> base;
+    {
+        Mapper m(s.w.db, s.w.feats, opt);
+        base = m.run();
+    }
+    check(!base.empty() && base[0].numRegistered() == 20, "tie scene: the clean scene registers");
+    if (base.empty() || base[0].numRegistered() != 20) return;
+    const Reconstruction split = splitModel(s, base[0], 2.0);
+    size_t ndup = 0;
+    for (uint8_t d : s.dup) ndup += d;
+
+    const Reconstruction off = tieRefine(s, split, opt, nullptr, nullptr);
+    const Reconstruction zero = tieRefine(s, split, opt, "0", nullptr);
+    const Reconstruction keep = tieRefine(s, split, opt, "3", nullptr);
+    const Reconstruction drop = tieRefine(s, split, opt, "3", "0");
+    const Reconstruction gated = tieRefine(s, split, opt, "3", "1", "20");
+    const Reconstruction high = tieRefine(s, split, opt, "1000", nullptr);
+    struct Row { const char* name; const Reconstruction* m; } rows[] = {
+        {"split", &split}, {"off", &off}, {"N=3 keep", &keep}, {"N=3 drop", &drop},
+        {"N=3 keep near 20", &gated}, {"N=1000", &high}};
+    for (const Row& r : rows)
+        printf("tie-merge: %-16s block/pre %.3f, %zu/%zu copies one point, %zu points, %u "
+               "images\n", r.name, blockRatio(*r.m), joinedCopies(s, *r.m), ndup,
+               r.m->points3D.size(), r.m->numRegistered());
+    check(std::fabs(blockRatio(split) - 2.0) < 0.01 && joinedCopies(s, split) == 0,
+          "the split model holds the block at x2, every copy apart");
+    check(sameModel(off, zero) && off.points3D.size() == zero.points3D.size(),
+          "SS_SFM_TIE_MERGE=0 is off");
+    check(blockRatio(off) > 1.9 && joinedCopies(s, off) <= ndup / 50,
+          "off: the copies stay two points, the block x2");
+    check(sameModel(off, high) && off.points3D.size() == high.points3D.size(),
+          "a tie count nothing reaches merges nothing");
+    check(std::fabs(blockRatio(keep) - 1.0) < 0.03 && joinedCopies(s, keep) >= 0.9 * ndup,
+          "N=3 keep: the copies become one point and the block one scale with the rest");
+    check(std::fabs(blockRatio(gated) - 1.0) < 0.03, "the near gate keeps the wall's ties");
+
+    // Off leaves the mapper's log line for line as it was.
+    Walk w = makeWalk();
+    MapperOptions wo;
+    wo.verbose = true;
+    wo.focal = w.focal;
+    wo.device = device;
+    std::vector<SequenceDef> defs(1);
+    defs[0].members = {""};
+    const SequenceTable seqs = buildSequenceTable(w.names, defs);
+    const std::string tmp = (std::filesystem::temp_directory_path() /
+                             ("sfm_tie_test_" + std::to_string(getpid()))).string();
+    std::vector<Reconstruction> a, b;
+    const std::vector<std::string> log_unset = mapperLog(w, wo, seqs, tmp + ".a.log", a);
+    setTieEnv("0", "0", "5");
+    const std::vector<std::string> log_zero = mapperLog(w, wo, seqs, tmp + ".b.log", b);
+    setTieEnv(nullptr, nullptr, nullptr);
+    std::filesystem::remove(tmp + ".a.log");
+    std::filesystem::remove(tmp + ".b.log");
+    check(log_unset == log_zero && !a.empty() && !b.empty() && sameModel(a[0], b[0]),
+          "SS_SFM_TIE_MERGE=0: the walk's model and log as without it");
+
+    // On over a whole run (the walk repeats its room feature for feature).
+    setTieEnv("3", nullptr, nullptr);
+    std::vector<Reconstruction> on;
+    {
+        MapperOptions quiet = wo;
+        quiet.verbose = false;
+        Mapper m(w.db, w.feats, quiet, {}, nullptr, &seqs);
+        on = m.run();
+    }
+    setTieEnv(nullptr, nullptr, nullptr);
+    uint32_t reg = 0;
+    const double err = on.empty() ? -1 : shapeError(on.front(), w, reg);
+    printf("tie-merge: the walk with N=3 keep: %u/%zu cameras in %zu model(s), shape error %.3f\n",
+           reg, w.gt.size(), on.size(), err);
+}
 #endif
 
 static int cmdSequenceTest(int argc, char** argv) {
@@ -393,6 +633,7 @@ static int cmdSequenceTest(int argc, char** argv) {
     if (gpu) testMapperWalk(device, verbose);
 #ifndef _WIN32
     if (gpu) testTrace(device);
+    if (gpu) testTieMerge(device);
 #endif
     printf("%s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;

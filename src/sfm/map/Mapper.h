@@ -5511,6 +5511,7 @@ private:
                 ProfTimer pt(g_map_prof.retri);
                 track_changes = completeAndRetriangulate();
             }
+            if (tie_merge_ > 0) tieMerge(i + 1);
             size_t before = countObservations();
             BundleOptions bo;
             bo.real = realCfgFromName(opt_.ba_real);
@@ -5714,6 +5715,183 @@ private:
             }
         }
         return 0;
+    }
+
+    // SS_SFM_TIE_MERGE=N: fuse point pairs that N or more verified matches tie, whatever
+    // their reprojection, strongest ties first; the clash rule and the track cap still hold.
+    // SS_SFM_TIE_NEAR=D: only points nearer than D baselines to one of their cameras.
+    // SS_SFM_TIE_KEEP=0 drops a fused point's observations over the error limit before
+    // the BA; 1 (default) leaves them to the robust loss and the filter after it.
+    struct TieStats {
+        size_t linked = 0, candidates = 0, merged = 0, joined = 0, clash = 0, cap = 0, distant = 0;
+        size_t kept_obs = 0, dropped_obs = 0, points_before = 0, points_after = 0;
+    };
+
+    TieStats tieMerge(int round) {
+        TieStats st;
+        st.points_before = rec_.points3D.size();
+        ModelIndex mi = indexModel();
+        const uint32_t n = (uint32_t)db_.images.size();
+        std::vector<uint8_t> reg(n, 0);
+        std::vector<Vec3> centers(n);
+        for (uint32_t i = 0; i < n; i++)
+            if (mi.img[i] && mi.img[i]->registered) {
+                reg[i] = 1;
+                centers[i] = cameraCenter(mi.img[i]->pose);
+            }
+        std::unordered_map<uint64_t, uint32_t> count;
+        for (uint32_t a = 0; a < n; a++) {
+            if (!reg[a]) continue;
+            const std::vector<uint64_t>& ids = mi.img[a]->point3D_ids;
+            for (uint32_t f = 0; f < (uint32_t)ids.size(); f++) {
+                const uint64_t p = ids[f];
+                if (p == kInvalidPoint3D) continue;
+                for (const Correspondence& c : graph_.at(a, f)) {
+                    if (c.image_id <= a || !reg[c.image_id]) continue;
+                    const uint64_t q = mi.img[c.image_id]->point3D_ids[c.feature_idx];
+                    if (q == kInvalidPoint3D || q == p) continue;
+                    count[(std::min(p, q) << 32) | std::max(p, q)]++;
+                }
+            }
+        }
+        st.linked = count.size();
+        struct Tie { uint32_t n; uint64_t p, q; };
+        std::vector<Tie> ties;
+        for (const auto& kv : count)
+            if (kv.second >= (uint32_t)tie_merge_)
+                ties.push_back({kv.second, kv.first >> 32, kv.first & 0xffffffffull});
+        std::sort(ties.begin(), ties.end(), [](const Tie& x, const Tie& y) {
+            return x.n != y.n ? x.n > y.n : x.p != y.p ? x.p < y.p : x.q < y.q;
+        });
+        st.candidates = ties.size();
+
+        // Depth over the camera's baseline (nearest registered image within 10 ids, else any),
+        // taken on the points as they are before any fusion.
+        std::unordered_map<uint64_t, uint8_t> is_close;
+        if (tie_near_ > 0) {
+            std::vector<double> base(n, 0);
+            for (uint32_t i = 0; i < n; i++) {
+                if (!reg[i]) continue;
+                double nb = 0, ab = 0;
+                for (uint32_t j = 0; j < n; j++) {
+                    if (!reg[j] || j == i) continue;
+                    const double d = (centers[j] - centers[i]).norm();
+                    if (ab == 0 || d < ab) ab = d;
+                    if ((j > i ? j - i : i - j) <= 10 && (nb == 0 || d < nb)) nb = d;
+                }
+                base[i] = nb > 0 ? nb : ab;
+            }
+            for (const Tie& t : ties)
+                for (uint64_t id : {t.p, t.q}) {
+                    if (is_close.count(id)) continue;
+                    const Point3D& pt = rec_.points3D.at(id);
+                    bool is_near = false;
+                    for (const TrackElement& e : pt.track)
+                        is_near = is_near || (base[e.image_id] > 0 &&
+                                              (pt.xyz - centers[e.image_id]).norm() <
+                                                  tie_near_ * base[e.image_id]);
+                    is_close[id] = is_near;
+                }
+        }
+
+        std::unordered_map<uint64_t, uint64_t> into;
+        auto find = [&](uint64_t id) {
+            uint64_t r = id;
+            for (auto it = into.find(r); it != into.end(); it = into.find(r)) r = it->second;
+            for (uint64_t k = id; k != r;) {
+                uint64_t& next = into[k];
+                k = std::exchange(next, r);
+            }
+            return r;
+        };
+        std::map<uint64_t, std::vector<Vec3>> starts;  // survivor -> its parts' positions
+        std::vector<uint8_t> on_track(n, 0);
+        for (const Tie& t : ties) {
+            if (tie_near_ > 0 && (!is_close[t.p] || !is_close[t.q])) { st.distant++; continue; }
+            uint64_t a = find(t.p), b = find(t.q);
+            if (a == b) { st.joined++; continue; }
+            Point3D* A = &rec_.points3D.at(a);
+            Point3D* B = &rec_.points3D.at(b);
+            if (!opt_.tracks.allowsMerge(A->track.size(), B->track.size())) { st.cap++; continue; }
+            bool clash = false;
+            for (const TrackElement& e : A->track) on_track[e.image_id] = 1;
+            for (const TrackElement& e : B->track) clash = clash || on_track[e.image_id];
+            for (const TrackElement& e : A->track) on_track[e.image_id] = 0;
+            if (clash) { st.clash++; continue; }
+            if (B->track.size() > A->track.size()) {
+                std::swap(a, b);
+                std::swap(A, B);
+            }
+            std::vector<Vec3>& sa = starts[a];
+            if (sa.empty()) sa.push_back(A->xyz);
+            auto sb = starts.find(b);
+            if (sb == starts.end()) {
+                sa.push_back(B->xyz);
+            } else {
+                sa.insert(sa.end(), sb->second.begin(), sb->second.end());
+                starts.erase(sb);
+            }
+            for (const TrackElement& e : B->track) {
+                mi.img[e.image_id]->point3D_ids[e.point2D_idx] = a;
+                A->track.push_back(e);
+            }
+            rec_.points3D.erase(b);
+            into[b] = a;
+            st.merged++;
+        }
+
+        const double err = opt_.max_reproj_error;
+        for (auto& kv : starts) {
+            Point3D& pt = rec_.points3D.at(kv.first);
+            std::vector<PointObservation> obs;
+            obs.reserve(pt.track.size());
+            for (const TrackElement& e : pt.track)
+                obs.push_back({poseToP(mi.img[e.image_id]->pose),
+                               mi.cam[e.image_id]->bearing(kp(e.image_id, e.point2D_idx)),
+                               mi.cam[e.image_id]->errRad(err)});
+            double best = std::numeric_limits<double>::infinity();
+            for (const Vec3& s : kv.second) {
+                const Vec3 x = refineTriangulatedPoint(s, obs, 20);
+                const double c = pointAngularCost(x, obs);
+                if (c < best) {
+                    best = c;
+                    pt.xyz = x;
+                }
+            }
+            if (tie_keep_) {
+                st.kept_obs += pt.track.size();
+                continue;
+            }
+            size_t keep = 0;
+            for (const TrackElement& e : pt.track) {
+                if (reprojErrAt(mi, e.image_id, e.point2D_idx, pt.xyz) <=
+                    err * mi.pixel_scale[e.image_id]) {
+                    pt.track[keep++] = e;
+                } else {
+                    mi.img[e.image_id]->point3D_ids[e.point2D_idx] = kInvalidPoint3D;
+                    st.dropped_obs++;
+                }
+            }
+            pt.track.resize(keep);
+            if (keep < 2) {
+                for (const TrackElement& e : pt.track)
+                    mi.img[e.image_id]->point3D_ids[e.point2D_idx] = kInvalidPoint3D;
+                st.dropped_obs += keep;
+                rec_.points3D.erase(kv.first);
+            } else {
+                st.kept_obs += keep;
+            }
+        }
+        st.points_after = rec_.points3D.size();
+        const std::string f = MapTrace::fields(
+            "round=%d linked=%zu candidates=%zu merged=%zu joined=%zu clash=%zu cap=%zu far=%zu "
+            "kept_obs=%zu dropped_obs=%zu points_before=%zu points_after=%zu", round, st.linked,
+            st.candidates, st.merged, st.joined, st.clash, st.cap, st.distant, st.kept_obs,
+            st.dropped_obs, st.points_before, st.points_after);
+        slog::diag(slog::Tag::Map, "[tie] n=%d near=%d keep=%d %s", tie_merge_, tie_near_,
+                   tie_keep_, f.c_str());
+        trace("tie_merge", f);
+        return st;
     }
 
     // Does some pair of views of `a` + `b` see `x` from far enough apart to fix
@@ -6299,6 +6477,9 @@ private:
     bool ba_requested_ = false;
     std::unordered_set<uint64_t> welded_;  // fused by fuseSeams; the next globalRefine spares them
     int refine_rounds_ = 0;                // BA rounds the last globalRefine ran
+    const int tie_merge_ = experimentInt("SFM_TIE_MERGE", 0, 1000000);  // tieMerge(); 0 = off
+    const int tie_near_ = experimentInt("SFM_TIE_NEAR", 0, 1000000);
+    const int tie_keep_ = experimentInt("SFM_TIE_KEEP", 1, 1);
     // Counted from const passes that fan out over threads (the audit, the
     // seed prefetch).
     mutable std::atomic<uint32_t> prior_vouched_{0}, prior_seeds_{0};
