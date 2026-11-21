@@ -234,6 +234,15 @@ struct MapperOptions {
     // such sets. Speed comes from convergence-adaptive iterations + the
     // persistent solver instead (D38).
     double ba_growth_ratio = 1.1;      // COLMAP ba_global_images_ratio
+    // Near-support gate, sequences only (0 = off; Mapper::nearHold): a frontier image with
+    // under near_min pool points within near_baselines baselines of its registered neighbour
+    // waits. SS_SFM_NEAR_MIN / SS_SFM_NEAR_BASELINES.
+    int near_min = 0;
+    int near_baselines = 20;
+    // PnP and its ratio gate over pool points triangulated at >= this angle (0 = off; whole
+    // pool when under 2 * min_num_pnp_inliers qualify); the pose then observes the whole pool.
+    // SS_SFM_PNP_MIN_TRI_DEG (degrees).
+    double pnp_min_tri_deg = 0.0;
     int ba_max_refinements = 5;        // final pass; growth passes use 2
     // LM cap of a final pass holding absolute centre factors: COLMAP's
     // ba_global_max_num_iterations. At 25, both final solves of a canopy drone capture under
@@ -397,7 +406,19 @@ public:
           priors_(priors && opt.use_priors ? priors : nullptr) {
         opt_.tracks.readExperiments();
         opt_.seed_essential = experimentInt("SFM_SEED_ESSENTIAL", opt_.seed_essential, 3);
+        opt_.near_min = experimentInt("SFM_NEAR_MIN", opt_.near_min, 100000);
+        opt_.near_baselines = experimentInt("SFM_NEAR_BASELINES", opt_.near_baselines, 100000);
+        if (opt_.near_min > 0 && opt_.near_baselines <= 0)
+            throw std::invalid_argument("invalid SS_SFM_NEAR_BASELINES");
+        opt_.pnp_min_tri_deg = experimentDouble("SFM_PNP_MIN_TRI_DEG", opt_.pnp_min_tri_deg, 90.0);
     }
+
+    // What the near-support gate and the triangulation-angle filter did over this run.
+    struct NearStats {
+        uint32_t gated = 0, holds = 0, forced = 0, retriangulated = 0;
+        uint32_t tri_filtered = 0, tri_fallback = 0;
+    };
+    const NearStats& nearStats() const { return near_stats_; }
 
     const RigTable* rigs() const { return rigs_; }
     const SequenceTable* sequences() const { return seq_; }
@@ -2817,6 +2838,19 @@ private:
             if (seq_)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_sequence_summary,
                          {(long long)reg_near_won_, (long long)reg_vouched_});
+            if (opt_.near_min > 0)
+                slog::diag(slog::Tag::Map,
+                           "[map] near-support gate (%d points within %d baselines): %u image(s) "
+                           "gated, %u hold(s), %u forced through, %u neighbour retriangulation(s)",
+                           opt_.near_min, opt_.near_baselines, near_stats_.gated,
+                           near_stats_.holds, near_stats_.forced, near_stats_.retriangulated);
+            if (opt_.pnp_min_tri_deg > 0)
+                slog::diag(slog::Tag::Map,
+                           "[map] PnP over points triangulated at >= %.2f deg: %u registration "
+                           "attempt(s) had points under it, %u of them on the whole pool "
+                           "(under %d qualified)",
+                           opt_.pnp_min_tri_deg, near_stats_.tri_filtered,
+                           near_stats_.tri_fallback, 2 * opt_.min_num_pnp_inliers);
             if (priors_)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_prior_summary,
                          {(long long)prior_stats_.corrected, (long long)prior_stats_.refused,
@@ -3040,7 +3074,10 @@ private:
             }
             if (cands.empty()) break;
             bool registered = false;
+            const bool gate = opt_.near_min > 0 && seq_;
+            if (gate) nearPassStart(cands);
             for (uint32_t img : cands) {
+                if (gate && nearBlocked(img)) continue;
                 reg_trials_[img]++;
                 g_map_prof.n_reg_try++;
                 bool ok;
@@ -3052,6 +3089,12 @@ private:
                     g_map_prof.n_reg_ok++;
                     registered = true;
                     registered_here++;
+                    if (gate) {
+                        near_epoch_++;
+                        if (near_bypass_ && std::find(near_force_.begin(), near_force_.end(), img) !=
+                                                near_force_.end())
+                            near_stats_.forced++;
+                    }
                     {
                         ProfTimer pt(g_map_prof.tri);
                         triangulateForImage(img);
@@ -3063,9 +3106,12 @@ private:
                     frame_regs_ = 0;
                     break;
                 }
+                // A hold triangulated the held image's neighbour again: rank anew.
+                if (gate && near_retri_) break;
             }
             // A GPS frame dropped mid-ranking gave back the trials it refused.
             const bool rerank = std::exchange(gps_latch_rerank_, false);
+            if (gate && !registered && nearPassEnd()) continue;
             if (!registered && rerank) continue;
             if (!registered) break;  // nothing in the ranking can be registered
             const bool due = rec_.numRegistered() >= next_ba;
@@ -4209,6 +4255,138 @@ private:
         pyramid_score_[img] += score;
     }
 
+    // ---- near-support gate (MapperOptions::near_min) ------------------------
+    // Scale broke where a frame registered on few points, almost none near: a confident wrong
+    // pose BA cannot repair. It waits; skipping past it was worse, so the frames beyond wait.
+
+    bool seqRegistered(int32_t sq, int32_t p, uint32_t* out = nullptr) const {
+        if (p < 0 || p >= (int32_t)seq_imgs_[sq].size()) return false;
+        for (uint32_t i : seq_imgs_[sq][p])
+            if (rec_.images.at(i).registered) {
+                if (out) *out = i;
+                return true;
+            }
+        return false;
+    }
+
+    // The nearest registered image of img's sequence within the window, or false.
+    bool seqAnchor(uint32_t img, uint32_t& anchor) const {
+        if (!seq_->has(img)) return false;
+        const int32_t sq = seq_->seq[img], p = seq_->pos[img];
+        for (int d = 0; d <= opt_.sequence_window; d++) {
+            if (seqRegistered(sq, p - d, &anchor) && anchor != img) return true;
+            if (seqRegistered(sq, p + d, &anchor) && anchor != img) return true;
+        }
+        return false;
+    }
+
+    // One baseline at the anchor: distance per position step to the nearest other registered
+    // position of its sequence; else the distance to the nearest registered camera.
+    double anchorBaseline(uint32_t anchor) const {
+        const Vec3 ca = cameraCenter(rec_.images.at(anchor).pose);
+        const int32_t sq = seq_->seq[anchor], p = seq_->pos[anchor];
+        const int32_t len = (int32_t)seq_imgs_[sq].size();
+        for (int32_t d = 1; d < len; d++)
+            for (int32_t q : {p - d, p + d}) {
+                uint32_t o;
+                if (!seqRegistered(sq, q, &o)) continue;
+                const double b = (cameraCenter(rec_.images.at(o).pose) - ca).norm() / d;
+                if (b > 0) return b;
+            }
+        double best = 0;
+        for (const auto& kv : rec_.images) {
+            if (!kv.second.registered || kv.first == anchor) continue;
+            const double b = (cameraCenter(kv.second.pose) - ca).norm();
+            if (b > 0 && (best == 0 || b < best)) best = b;
+        }
+        return best;
+    }
+
+    void nearPassStart(std::vector<uint32_t>& cands) {
+        if (seq_imgs_.empty()) {
+            seq_imgs_.resize(seq_->length.size());
+            for (size_t k = 0; k < seq_imgs_.size(); k++) seq_imgs_[k].resize(seq_->length[k]);
+            for (uint32_t i = 0; i < db_.images.size(); i++)
+                if (seq_->has(i)) seq_imgs_[seq_->seq[i]][seq_->pos[i]].push_back(i);
+            near_retri_at_.assign(db_.images.size(), 0);
+            near_was_gated_.assign(db_.images.size(), 0);
+        }
+        near_held_.clear();
+        near_retri_ = false;
+        near_bypass_ = std::exchange(near_bypass_next_, false);
+        if (!near_bypass_) return;
+        // The held images first, best-supported first, then the rest in rank order.
+        std::vector<uint32_t> out;
+        out.reserve(cands.size());
+        for (uint32_t i : near_force_)
+            if (std::find(cands.begin(), cands.end(), i) != cands.end()) out.push_back(i);
+        for (uint32_t i : cands)
+            if (std::find(out.begin(), out.end(), i) == out.end()) out.push_back(i);
+        cands.swap(out);
+    }
+
+    // A pass registered nothing: true when another should run (a neighbour made points, or
+    // the held images are to be forced through).
+    bool nearPassEnd() {
+        if (near_retri_) return true;
+        if (near_bypass_ || near_held_.empty()) return false;
+        std::stable_sort(near_held_.begin(), near_held_.end(),
+                         [](const NearHold& a, const NearHold& b) { return a.support > b.support; });
+        near_force_.clear();
+        for (const NearHold& h : near_held_) near_force_.push_back(h.img);
+        near_bypass_next_ = true;
+        return true;
+    }
+
+    // Beyond an image held in this pass, away from the model; not when the image's own
+    // anchor lies beyond the held one (the model reaches it from the far side).
+    bool nearBlocked(uint32_t img) const {
+        if (near_bypass_ || near_held_.empty() || !seq_->has(img)) return false;
+        const int32_t sq = seq_->seq[img], p = seq_->pos[img];
+        uint32_t a;
+        const bool anchored = seqAnchor(img, a);
+        for (const NearHold& h : near_held_) {
+            if (h.seq != sq || h.dir == 0 || (p - h.pos) * h.dir <= 0) continue;
+            if (anchored && (seq_->pos[a] - h.pos) * h.dir > 0) continue;
+            return true;
+        }
+        return false;
+    }
+
+    // The gate itself, on img's pool (X, pid from gatherCorrespondences): true = hold.
+    bool nearHold(uint32_t img, const std::vector<Vec3>& X, const std::vector<uint64_t>& pid) {
+        if (near_bypass_) return false;
+        uint32_t anchor;
+        if (!seqAnchor(img, anchor)) return false;  // not on a sequence frontier: no gate
+        const double b = anchorBaseline(anchor);
+        if (!(b > 0)) return false;
+        const Vec3 ca = cameraCenter(rec_.images.at(anchor).pose);
+        const double r = opt_.near_baselines * b;
+        std::vector<uint64_t> close;
+        for (size_t k = 0; k < X.size(); k++)
+            if ((X[k] - ca).norm() < r) close.push_back(pid[k]);
+        std::sort(close.begin(), close.end());
+        const int n = (int)(std::unique(close.begin(), close.end()) - close.begin());
+        if (n >= opt_.near_min) return false;
+        const int32_t dp = seq_->pos[img] - seq_->pos[anchor];
+        near_held_.push_back({img, seq_->seq[img], seq_->pos[img], (dp > 0) - (dp < 0), n});
+        near_stats_.holds++;
+        if (!near_was_gated_[img]) { near_was_gated_[img] = 1; near_stats_.gated++; }
+        if (seq_dump_)
+            slog::diag(slog::Tag::Map, "[seq] %s: %d near of %zu (within %.3g of %s) -> held",
+                       db_.images[img].name.c_str(), n, X.size(), r,
+                       db_.images[anchor].name.c_str());
+        // Once per neighbour and model state; a re-rank only when it made points.
+        if (near_retri_at_[anchor] != near_epoch_) {
+            near_retri_at_[anchor] = near_epoch_;
+            const size_t before = rec_.points3D.size();
+            triangulateForImage(anchor);
+            near_stats_.retriangulated++;
+            near_retri_ = rec_.points3D.size() != before;
+        }
+        return true;
+    }
+
     // Candidates for the next registration, best first: unregistered, still
     // within their trial budget, and seeing at least min_num_pnp_inliers
     // triangulated points. The gate is the correspondence count; the *order* is
@@ -4490,6 +4668,16 @@ private:
         std::vector<char> nearf;
         gatherCorrespondences(img, X, br, feat, pid, seq_ ? &nearf : nullptr);
         if ((int)X.size() < opt_.min_num_pnp_inliers) { reg_fail_.few_corr++; return false; }
+        if (opt_.near_min > 0 && seq_ && nearHold(img, X, pid)) {
+            reg_trials_[img]--;  // a hold is not a failed trial
+            return false;
+        }
+        // The whole pool, when the PnP below runs on its well-triangulated part only.
+        std::vector<Vec3> X_all;
+        std::vector<uint32_t> feat_all;
+        std::vector<uint64_t> pid_all;
+        const bool tri_filtered = opt_.pnp_min_tri_deg > 0 &&
+                                  keepWellTriangulated(X, br, feat, pid, nearf, X_all, feat_all, pid_all);
 
         const uint32_t cid = rec_.images[img].camera_id;
         PnPResult r;
@@ -4599,7 +4787,75 @@ private:
         if (pool < X.size()) reg_fail_.occluded += (uint32_t)(X.size() - pool);
         focal_known_.insert(cid);
 
+        if (tri_filtered) {
+            // Found and judged on the well-triangulated points, the pose observes the whole pool.
+            X.swap(X_all);
+            feat.swap(feat_all);
+            pid.swap(pid_all);
+            br.resize(feat.size());
+            for (size_t k = 0; k < feat.size(); k++) br[k] = bearing(img, feat[k]);
+            classify(img, X, br, r);
+        }
         commitPose(img, r.pose, feat, pid, r.inlier_mask, r.num_inliers, X.size());
+        return true;
+    }
+
+    // MapperOptions::pnp_min_tri_deg (track sampled with a stride, as in wellTriangulated);
+    // the whole pool goes to *_all. False, pool unchanged, when none is removed or fewer than
+    // 2 * min_num_pnp_inliers qualify.
+    bool keepWellTriangulated(std::vector<Vec3>& X, std::vector<Vec3>& br, std::vector<uint32_t>& feat,
+                              std::vector<uint64_t>& pid, std::vector<char>& nearf,
+                              std::vector<Vec3>& X_all, std::vector<uint32_t>& feat_all,
+                              std::vector<uint64_t>& pid_all) {
+        const double min_ang = opt_.pnp_min_tri_deg * M_PI / 180.0;
+        constexpr size_t kMaxScan = 12;
+        std::unordered_map<uint32_t, Vec3> centers;
+        auto center = [&](uint32_t i) -> const Vec3& {
+            auto it = centers.find(i);
+            if (it == centers.end())
+                it = centers.emplace(i, cameraCenter(rec_.images.at(i).pose)).first;
+            return it->second;
+        };
+        std::vector<char> keep(X.size(), 0);
+        size_t n = 0;
+        std::vector<uint32_t> imgs;
+        for (size_t k = 0; k < X.size(); k++) {
+            const std::vector<TrackElement>& t = rec_.points3D.at(pid[k]).track;
+            imgs.clear();
+            const size_t stride = std::max<size_t>(1, t.size() / kMaxScan);
+            for (size_t i = 0; i < t.size(); i += stride) imgs.push_back(t[i].image_id);
+            if (t.size() > 1 && imgs.back() != t.back().image_id) imgs.push_back(t.back().image_id);
+            bool ok = false;
+            for (size_t i = 0; i + 1 < imgs.size() && !ok; i++)
+                for (size_t j = i + 1; j < imgs.size() && !ok; j++)
+                    ok = triangulationAngle(X[k], center(imgs[i]), center(imgs[j])) >= min_ang;
+            keep[k] = ok ? 1 : 0;
+            n += ok ? 1 : 0;
+        }
+        if (n == X.size()) return false;
+        near_stats_.tri_filtered++;
+        if ((int)n < 2 * opt_.min_num_pnp_inliers) {
+            near_stats_.tri_fallback++;
+            return false;
+        }
+        X_all = X;
+        feat_all = feat;
+        pid_all = pid;
+        size_t w = 0;
+        for (size_t k = 0; k < X.size(); k++) {
+            if (!keep[k]) continue;
+            X[w] = X[k];
+            br[w] = br[k];
+            feat[w] = feat[k];
+            pid[w] = pid[k];
+            if (!nearf.empty()) nearf[w] = nearf[k];
+            w++;
+        }
+        X.resize(w);
+        br.resize(w);
+        feat.resize(w);
+        pid.resize(w);
+        if (!nearf.empty()) nearf.resize(w);
         return true;
     }
 
@@ -6225,6 +6481,22 @@ private:
     std::vector<int> near_score_;                      // per image, features with near support
     uint32_t reg_vouched_ = 0;   // registrations the neighbours carried past the pool's ratio
     uint32_t reg_near_won_ = 0;  // ... where the neighbours' pose beat the whole pool's
+    // Near-support gate (MapperOptions::near_min). Holds last one ranking pass; a pass that
+    // held some and registered none is followed by one with the gate open (near_bypass_).
+    struct NearHold {
+        uint32_t img;
+        int32_t seq, pos, dir;  // dir: away from the model side (0 = no direction)
+        int support;            // pool points within the near radius
+    };
+    std::vector<NearHold> near_held_;
+    std::vector<uint32_t> near_force_;      // the bypass pass's held images, best-supported first
+    bool near_bypass_ = false, near_bypass_next_ = false;
+    bool near_retri_ = false;               // a hold triangulated its neighbour again: re-rank
+    uint64_t near_epoch_ = 1;               // bumped by every registration
+    std::vector<uint64_t> near_retri_at_;   // per image, epoch of its last retriangulation
+    std::vector<char> near_was_gated_;
+    std::vector<std::vector<std::vector<uint32_t>>> seq_imgs_;  // [seq][pos] -> images
+    NearStats near_stats_;
     int seed_phase_ = 0;         // 0: seed among neighbour pairs, 1: among every pair
     uint32_t reg_by_rig_ = 0;         // registrations the rig placed, summed over the run
     uint32_t reg_rig_word_ = 0;       // ... of them with no inlier of their own
