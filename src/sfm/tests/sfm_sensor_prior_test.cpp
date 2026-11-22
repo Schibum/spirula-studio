@@ -265,6 +265,19 @@ static void testTelemetryPriors() {
         corrected.fps += 1;
         TelemetryPriors changed_fps({corrected}, names, cams, po);
         check(fingerprint(changed_fps) != original, "capture frame rate belongs to provenance");
+        // A frame-time table: the same times as the rate gives are the same
+        // frames, but the table is part of what the calibration was made from.
+        int last = 0;
+        for (const std::string& nm : names) last = std::max(last, sensor_detail::stemIndex(nm));
+        corrected = cap;
+        for (int k = 0; k <= last; k++) corrected.frame_times.push_back(k / cap.fps);
+        TelemetryPriors by_table({corrected}, names, cams, po);
+        check(by_table.timedImages() == names.size(), "a frame-time table times every image");
+        check(fingerprint(by_table) != original, "the frame-time table belongs to provenance");
+        corrected.frame_times.resize((size_t)last);   // the last frame is past the table
+        TelemetryPriors short_table({corrected}, names, cams, po);
+        check(short_table.timedImages() == names.size() - 1,
+              "a frame past the table is not timed, never extrapolated");
         corrected = cap;
         corrected.readout += 0.001;
         TelemetryPriors changed_readout({corrected}, names, cams, po);

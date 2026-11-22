@@ -31,12 +31,13 @@ struct ManifestCamera {
     std::vector<double> params;      // complete COLMAP order, in source-image pixels
 };
 
-// One source video and the telemetry it carries. `telemetry` is the video
-// itself or a file the reader knows; frames under `prefix` are timed by the
-// source frame index in their stem over `fps` (0 = the file's own rate).
+// One source video and its telemetry; frames under `prefix` are timed by
+// `frame_times` (core/FrameTimes.h), else `fps`, else the video's own sample
+// times (0). `fps` with `frame_times` is an error: two answers to one question.
 struct ManifestCapture {
     std::string prefix;
     std::string telemetry;
+    std::string frame_times;
     double fps = 0;
     double time_offset = 0;   // seconds added to every frame time
     bool imu = true, gps = true;   // false: that half of the file is ignored

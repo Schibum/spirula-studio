@@ -42,6 +42,7 @@
 #include "sfm/core/FeatureCompaction.h"
 #include "sfm/core/Log.h"
 #include "sfm/core/Features.h"
+#include "sfm/core/FrameTimes.h"
 #include "sfm/core/Image.h"
 #include "sfm/core/LensCalibration.h"
 #include "sfm/core/ImageLoader.h"
@@ -270,6 +271,20 @@ SensorCaptures loadSensorCaptures(const SfmConfig& cfg, bool verbose) {
         lc->cap.prefix = in.prefix;
         lc->cap.path = in.path;
         lc->cap.camera = t.camera;
+        // Frame times, in order: the caller's frame-time file; a rate it
+        // gave (`fps`, taken at its word); the video's sample times; the
+        // file's average rate (wrong for a clip with a hole).
+        const char* time_source = "rate";
+        if (!in.frame_times.empty()) {
+            if (!frameTimesRead(in.frame_times, lc->cap.frame_times, err)) {
+                L::warn(Tag::Orient, M::sensor_file_bad, {in.path, err});
+                continue;
+            }
+            time_source = "frame_times";
+        } else if (!(in.fps > 0) && !t.video_frame_times.empty()) {
+            lc->cap.frame_times = t.video_frame_times;
+            time_source = "video";
+        }
         lc->cap.fps = in.fps > 0 ? in.fps : t.video_fps;
         lc->cap.time_offset = in.time_offset;
         lc->cap.readout = t.frame_readout;
@@ -279,9 +294,18 @@ SensorCaptures loadSensorCaptures(const SfmConfig& cfg, bool verbose) {
                {in.path, t.camera.empty() ? "?" : t.camera, L::num(c.gyro.rate_hz, 0),
                 L::num(c.accel.rate_hz, 0), L::num(c.orientation.rate_hz, 0),
                 (long long)c.gps_distinct, L::num(c.gps_path_m, 0)});
-        if (!(lc->cap.fps > 0)) {
+        if (!timesFrames(lc->cap)) {
             L::warn(Tag::Orient, M::sensor_file_no_fps, {in.path});
             continue;
+        }
+        {
+            // The table the frames are timed by, or with a rate the one the
+            // video holds: how far a constant rate is from the real times.
+            const std::vector<double>& table =
+                lc->cap.frame_times.empty() ? t.video_frame_times : lc->cap.frame_times;
+            L::out(Tag::Orient, M::sensor_frame_times,
+                   {in.path, std::string(time_source), (long long)table.size(),
+                    L::num(1000.0 * frameTimesOffConstantRate(table), 1)});
         }
         if (verbose)
             for (const std::string& w : c.warnings) L::err_raw(Tag::Orient, w);

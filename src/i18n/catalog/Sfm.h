@@ -3310,6 +3310,21 @@ SS_MSG(sensor_file_no_fps,
     RU("Телеметрия: {0} не указывает частоту кадров, кадры нельзя привязать ко времени; задайте `fps` в манифесте"),
     TR("Telemetri: {0} kare hızı belirtmiyor, kareler zamanlanamaz; manifestte `fps` verin"));
 
+SS_MSG(sensor_frame_times,
+    EN("{0}: frame times from {1}, {2} frames, {3} ms off a constant rate at most"),
+    JA("{0}: フレーム時刻の出所は {1}、{2} フレーム、一定レートからのずれは最大 {3} ms"),
+    ZH_HANS("{0}: 帧时间来自 {1}，{2} 帧，与恒定帧率最多相差 {3} ms"),
+    ZH_HANT("{0}: 幀時間來自 {1}，{2} 幀，與恆定幀率最多相差 {3} ms"),
+    KO("{0}: 프레임 시각 출처 {1}, {2} 프레임, 일정한 속도에서 최대 {3} ms 벗어남"),
+    DE("{0}: Bildzeiten aus {1}, {2} Bilder, höchstens {3} ms neben einer konstanten Rate"),
+    FR("{0} : temps des images d'après {1}, {2} images, au plus {3} ms d'écart à une cadence constante"),
+    ES("{0}: tiempos de fotograma según {1}, {2} fotogramas, como mucho {3} ms fuera de una cadencia constante"),
+    PT("{0}: tempos das imagens segundo {1}, {2} imagens, no máximo {3} ms fora de uma cadência constante"),
+    IT("{0}: tempi dei fotogrammi da {1}, {2} fotogrammi, al più {3} ms da una cadenza costante"),
+    NL("{0}: frametijden uit {1}, {2} frames, hoogstens {3} ms naast een constante frequentie"),
+    RU("{0}: времена кадров из {1}, {2} кадров, не более {3} мс от постоянной частоты"),
+    TR("{0}: kare zamanları {1} kaynağından, {2} kare, sabit hızdan en çok {3} ms sapma"));
+
 SS_MSG(sensor_time_offset,
     EN("{0}: IMU clock {1} ms off the video, from {2} frame pairs"),
     JA("{0}: IMU の時計は映像に対して {1} ms ずれています ({2} 組のフレームから)"),

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/Env.h"
+#include "sfm/core/FrameTimes.h"
 #include "sfm/core/Telemetry.h"
 #include "sfm/tests/TestMain.h"
 
@@ -70,6 +71,12 @@ struct TrackSpec {
     uint32_t timescale;
     uint32_t sample_delta;
     std::vector<Bytes> samples;
+    // Optional: a duration per sample (stts) instead of sample_delta, a
+    // composition offset per sample (ctts), and an edit list's media time
+    // (elst, one entry; < 0: none).
+    std::vector<uint32_t> deltas = {};
+    std::vector<int32_t> ctts = {};
+    int64_t edit_media_time = -1;
 };
 
 // ftyp, mdat (every track's samples in order), moov.
@@ -100,7 +107,12 @@ static Bytes build_mp4(const std::vector<TrackSpec>& tracks, uint32_t mv_timesca
         Bytes mdhd_p;
         put_be32(mdhd_p, creation_1904); put_be32(mdhd_p, creation_1904);
         put_be32(mdhd_p, t.timescale);
-        put_be32(mdhd_p, (uint32_t)(t.samples.size() * t.sample_delta));
+        uint32_t media_duration = (uint32_t)(t.samples.size() * t.sample_delta);
+        if (!t.deltas.empty()) {
+            media_duration = 0;
+            for (uint32_t d : t.deltas) media_duration += d;
+        }
+        put_be32(mdhd_p, media_duration);
         put_be16(mdhd_p, 0); put_be16(mdhd_p, 0);
         Bytes hdlr_p;
         put_be32(hdlr_p, 0); put_str(hdlr_p, t.handler);
@@ -109,7 +121,13 @@ static Bytes build_mp4(const std::vector<TrackSpec>& tracks, uint32_t mv_timesca
 
         Bytes entry_p(8, 0);
         Bytes stsd_p; put_be32(stsd_p, 1); put_raw(stsd_p, box(t.sample_type, entry_p));
-        Bytes stts_p; put_be32(stts_p, 1); put_be32(stts_p, (uint32_t)t.samples.size()); put_be32(stts_p, t.sample_delta);
+        Bytes stts_p;
+        if (t.deltas.empty()) {
+            put_be32(stts_p, 1); put_be32(stts_p, (uint32_t)t.samples.size()); put_be32(stts_p, t.sample_delta);
+        } else {
+            put_be32(stts_p, (uint32_t)t.deltas.size());
+            for (uint32_t d : t.deltas) { put_be32(stts_p, 1); put_be32(stts_p, d); }
+        }
         Bytes stsc_p; put_be32(stsc_p, 1); put_be32(stsc_p, 1); put_be32(stsc_p, (uint32_t)t.samples.size()); put_be32(stsc_p, 1);
         Bytes stsz_p; put_be32(stsz_p, 0); put_be32(stsz_p, (uint32_t)t.samples.size());
         for (const Bytes& s : t.samples) put_be32(stsz_p, (uint32_t)s.size());
@@ -119,12 +137,23 @@ static Bytes build_mp4(const std::vector<TrackSpec>& tracks, uint32_t mv_timesca
         put_raw(stbl_p, full("stsd", stsd_p)); put_raw(stbl_p, full("stts", stts_p));
         put_raw(stbl_p, full("stsc", stsc_p)); put_raw(stbl_p, full("stsz", stsz_p));
         put_raw(stbl_p, full("stco", stco_p));
+        if (!t.ctts.empty()) {
+            Bytes ctts_p; put_be32(ctts_p, (uint32_t)t.ctts.size());
+            for (int32_t o : t.ctts) { put_be32(ctts_p, 1); put_be32(ctts_p, (uint32_t)o); }
+            put_raw(stbl_p, full("ctts", ctts_p, 1));
+        }
         Bytes minf_p = box("stbl", stbl_p);
         Bytes mdia_p;
         put_raw(mdia_p, full("mdhd", mdhd_p)); put_raw(mdia_p, full("hdlr", hdlr_p));
         put_raw(mdia_p, box("minf", minf_p));
         Bytes trak_p;
-        put_raw(trak_p, full("tkhd", tkhd_p)); put_raw(trak_p, box("mdia", mdia_p));
+        put_raw(trak_p, full("tkhd", tkhd_p));
+        if (t.edit_media_time >= 0) {
+            Bytes elst_p; put_be32(elst_p, 1);
+            put_be32(elst_p, mv_duration); put_be32(elst_p, (uint32_t)t.edit_media_time); put_be32(elst_p, 0x00010000);
+            put_raw(trak_p, box("edts", full("elst", elst_p)));
+        }
+        put_raw(trak_p, box("mdia", mdia_p));
         put_raw(moov_p, box("trak", trak_p));
     }
     Bytes out = ftyp;
@@ -190,6 +219,78 @@ static void test_camm() {
     check(tm.gps.size() == 1 && tm.gps[0].fix && close_to(tm.gps[0].lon, -79.4, 1e-9) && close_to(tm.gps[0].speed, 5.0, 1e-5) &&
           close_to(tm.gps[0].alt, 100.0, 1e-4) && close_to(tm.gps[0].t, 0.6, 1e-9), "camm: gps");
     check(close_to(tm.video_duration, 0.7, 1e-9), "camm: movie duration");
+}
+
+// The video track's own frame times: a hole, B-frames, an edit list.
+static void test_video_frame_times() {
+    auto read = [](TrackSpec video, const std::string& tag) {
+        // a CAMM track beside it, so the file has a carrier
+        TrackSpec camm{"camm", "camm", "CAMM", 1000, 100, {}};
+        Bytes s; put_le16(s, 0); put_le16(s, 2); put_lef32(s, 0.1f); put_lef32(s, 0.0f); put_lef32(s, 0.0f);
+        camm.samples.assign(3, s);
+        video.samples.assign(video.deltas.empty() ? 6 : video.deltas.size(), Bytes(4, 0));
+        const Bytes file = build_mp4({video, camm}, 1000, 700, 0);
+        Telemetry tm;
+        std::string err;
+        check(telemetry_read(file.data(), file.size(), tm, err), tag + ": read (" + err + ")");
+        return tm;
+    };
+    {
+        // constant rate: n / 30 s, and the average rate is the true one
+        const Telemetry tm = read({"avc1", "vide", "Video", 30000, 1000, {}}, "frame times, even");
+        check(tm.video_frame_times.size() == 6 && close_to(tm.video_frame_times[5], 5.0 / 30, 1e-9) &&
+                  close_to(tm.video_fps, 30.0, 1e-9),
+              "frame times, even: n / rate");
+        check(frameTimesOffConstantRate(tm.video_frame_times) < 1e-9, "frame times, even: nothing off a constant rate");
+    }
+    {
+        // a hole of 200 ms after frame 2: the average rate is wrong for every frame, the table is not
+        TrackSpec v{"avc1", "vide", "Video", 30000, 1000, {}};
+        v.deltas = {1000, 1000, 7000, 1000, 1000, 1000, 1000, 1000};
+        const Telemetry tm = read(v, "frame times, hole");
+        check(tm.video_frame_times.size() == 8 && close_to(tm.video_frame_times[2], 2.0 / 30, 1e-9) &&
+                  close_to(tm.video_frame_times[3], 9.0 / 30, 1e-9) &&
+                  close_to(tm.video_frame_times[7], 13.0 / 30, 1e-9),
+              "frame times, hole: the frames after it are late by it");
+        check(tm.video_fps < 18.0, "frame times, hole: the average rate is far below 30");
+        check(frameTimesOffConstantRate(tm.video_frame_times) > 0.05, "frame times, hole: off a constant rate");
+    }
+    {
+        // B-frames: decoded I P B B, shown I B B P; composition offsets and
+        // the edit list that takes the first offset out again
+        TrackSpec v{"avc1", "vide", "Video", 30000, 1000, {}};
+        v.deltas = {1000, 1000, 1000, 1000};
+        v.ctts = {1000, 3000, 0, 0};
+        v.edit_media_time = 1000;
+        const Telemetry tm = read(v, "frame times, ctts");
+        check(tm.video_frame_times.size() == 4 && close_to(tm.video_frame_times[0], 0.0, 1e-9) &&
+                  close_to(tm.video_frame_times[1], 1.0 / 30, 1e-9) &&
+                  close_to(tm.video_frame_times[3], 3.0 / 30, 1e-9),
+              "frame times, ctts + elst: presentation order from 0");
+    }
+    {
+        // two frames shown at one time: no usable table, the reader falls back to the rate
+        TrackSpec v{"avc1", "vide", "Video", 30000, 1000, {}};
+        v.deltas = {1000, 1000, 1000};
+        v.ctts = {1000, 0, 0};
+        const Telemetry tm = read(v, "frame times, clash");
+        check(tm.video_frame_times.empty() && tm.video_fps > 0, "frame times, clash: no table, a rate");
+    }
+    {
+        // the sensor track's edit list moves its samples onto the movie's timeline
+        TrackSpec video{"avc1", "vide", "Video", 30000, 1000, {}};
+        video.samples.assign(6, Bytes(4, 0));
+        TrackSpec camm{"camm", "camm", "CAMM", 1000, 100, {}};
+        Bytes s; put_le16(s, 0); put_le16(s, 2); put_lef32(s, 0.1f); put_lef32(s, 0.0f); put_lef32(s, 0.0f);
+        camm.samples.assign(3, s);
+        camm.edit_media_time = 50;
+        const Bytes file = build_mp4({video, camm}, 1000, 700, 0);
+        Telemetry tm;
+        std::string err;
+        check(telemetry_read(file.data(), file.size(), tm, err) && tm.gyro.size() == 3 &&
+                  close_to(tm.gyro[0].t, -0.05, 1e-9) && close_to(tm.gyro[2].t, 0.15, 1e-9),
+              "frame times: the CAMM track follows its edit list");
+    }
 }
 
 static Bytes gpmf_payload(uint64_t stmp_us, int16_t a0, int16_t a1, int16_t a2, int32_t lat_e7, int32_t lon_e7) {
@@ -1138,6 +1239,7 @@ static int cmdTelemetryTest(int argc, char** argv) {
         return rc;
     }
     test_camm();
+    test_video_frame_times();
     test_gpmf();
     test_insta360(false);
     test_insta360(true);
