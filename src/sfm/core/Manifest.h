@@ -31,12 +31,9 @@ struct ManifestCamera {
     std::vector<double> params;      // complete COLMAP order, in source-image pixels
 };
 
-// One source video and the telemetry it carries. `telemetry` is the video
-// itself or a file the reader knows; frames under `prefix` are timed by the
-// source frame index in their stem: by `frame_times`, a file listing when
-// each source frame was shown (core/FrameTimes.h; relative to the manifest),
-// else over `fps`, else by the video's own sample times (0 = the file's own).
-// `fps` and `frame_times` together are an error: two answers to one question.
+// One source video and its telemetry; frames under `prefix` are timed by
+// `frame_times` (core/FrameTimes.h), else `fps`, else the video's own sample
+// times (0). `fps` with `frame_times` is an error: two answers to one question.
 struct ManifestCapture {
     std::string prefix;
     std::string telemetry;

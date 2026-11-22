@@ -48,11 +48,9 @@ inline bool timesFrames(const SensorCapture& cap) {
     return !cap.frame_times.empty() || cap.fps > 0;
 }
 
-// The time of source frame `idx` on the capture's clock: its entry in the
-// table, else index over rate, plus half the readout and the capture's
-// offset. Every stage that holds a frame against the sensors asks here.
-// False when the frame has no time: an index the table does not hold is
-// never extrapolated.
+// The time of source frame `idx` on the capture's clock: its table entry, else
+// index over rate, plus half the readout and the offset. False when the frame
+// has no time: an index the table does not hold is never extrapolated.
 inline bool frameTime(const SensorCapture& cap, int idx, double& t) {
     if (idx < 0) return false;
     double shown;

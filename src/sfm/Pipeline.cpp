@@ -271,10 +271,9 @@ SensorCaptures loadSensorCaptures(const SfmConfig& cfg, bool verbose) {
         lc->cap.prefix = in.prefix;
         lc->cap.path = in.path;
         lc->cap.camera = t.camera;
-        // When each frame was shown, in this order: the caller's frame-time
-        // file; a rate the caller gave (`fps`: it asked for one, so it is
-        // taken at its word); the video's own sample times; the file's
-        // average rate, which is wrong for a clip with a hole.
+        // Frame times, in order: the caller's frame-time file; a rate it
+        // gave (`fps`, taken at its word); the video's sample times; the
+        // file's average rate (wrong for a clip with a hole).
         const char* time_source = "rate";
         if (!in.frame_times.empty()) {
             if (!frameTimesRead(in.frame_times, lc->cap.frame_times, err)) {

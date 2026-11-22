@@ -265,9 +265,8 @@ int cmdSensorGaugeTest(int, char**) {
               "T8b no vertical declared, no up");
     }
     // ---- T9: a clip with a hole, timed by a frame-time table ------------------
-    // Five source frames are missing after frame 20: every later frame's
-    // number is 5 lower than its time over the rate says. The table has the
-    // real times, so the gauge is what T2 finds; a rate alone is 208 ms off.
+    // Five frames are missing after frame 20, so a rate alone is 208 ms off;
+    // the table has the real times and the gauge matches T2.
     {
         Scenario sc;
         sc.gps = false;
