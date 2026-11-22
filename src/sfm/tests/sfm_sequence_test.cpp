@@ -865,6 +865,114 @@ static void testTieSpan(int device, float off) {
     setSpanEnv(nullptr, nullptr, nullptr, nullptr);
     check(threw, "an invalid SS_SFM_TIE_CLASH is refused");
 }
+
+// The tie scene as a lens switch: cameras 0-9 sequence cam0, 10-19 sequence cam1, both
+// at positions 0-9 and frames 6 apart on one clock (cam0/00000 ... cam1/00114), so every
+// tie between the two copies is a match across the sequences.
+static void testTieCross(int device) {
+    TieScene s = makeTieScene();
+    for (uint32_t c = 0; c < 20; c++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "cam%u/%05u.jpg", c < 10 ? 0u : 1u, 6 * c);
+        s.w.names[c] = nm;
+        s.w.db.images[c].name = nm;
+    }
+    std::vector<SequenceDef> defs(2);
+    defs[0].members = {"cam0"};
+    defs[1].members = {"cam1"};
+    const SequenceTable seqs = buildSequenceTable(s.w.names, defs);
+    check(seqs.distance(0, 10) == INT_MAX && seqs.pos[0] == 0 && seqs.pos[10] == 0,
+          "tie cross: two sequences, cameras 0 and 10 both at position 0");
+    MapperOptions opt;
+    opt.focal = s.w.focal;
+    opt.device = device;
+    setTieEnv(nullptr, nullptr, nullptr);
+    setSpanEnv(nullptr, nullptr, nullptr, nullptr);
+    std::vector<Reconstruction> base;
+    {
+        Mapper m(s.w.db, s.w.feats, opt, {}, nullptr, &seqs);
+        base = m.run();
+    }
+    check(!base.empty() && base[0].numRegistered() == 20, "tie cross: the clean scene registers");
+    if (base.empty() || base[0].numRegistered() != 20) return;
+    const Reconstruction split = splitModel(s, base[0], 2.0);
+    size_t ndup = 0;
+    for (uint8_t d : s.dup) ndup += d;
+
+    // env: SS_SFM_TIE_* pairs, then the options' tie fields
+    auto run = [&](std::vector<std::pair<const char*, const char*>> env, int n, double span_s,
+                   double fps, bool cross) {
+        MapperOptions o = opt;
+        o.tie_merge = n;
+        o.tie_span_s = span_s;
+        o.tie_fps = fps;
+        o.tie_cross = cross;
+        for (auto& [k, v] : env) setenv(k, v, 1);
+        Reconstruction out;
+        {
+            Mapper m(s.w.db, s.w.feats, o, {}, nullptr, &seqs);
+            out = m.refine(split);
+        }
+        for (auto& [k, v] : env) unsetenv(k);
+        return out;
+    };
+    const Reconstruction off = run({}, 0, 0, 0, true);
+    const Reconstruction zero = run({}, 0, 1, 60, false);
+    const Reconstruction n3 = run({}, 3, 0, 0, true);
+    const Reconstruction sec = run({}, 3, 1, 60, true);
+    const Reconstruction sec0 = run({}, 3, 1, 60, false);
+    const Reconstruction sec_short = run({}, 3, 0.05, 60, true);
+    const Reconstruction img = run({{"SS_SFM_TIE_SPAN_IMAGES", "5"}}, 3, 0, 0, true);
+    const Reconstruction img0 = run({{"SS_SFM_TIE_SPAN_IMAGES", "5"}, {"SS_SFM_TIE_SPAN_CROSS", "0"}},
+                                    3, 0, 0, true);
+    const Reconstruction preset = run({{"SS_SFM_TIE_PRESET", "1"}, {"SS_SFM_TIE_SPAN_IMAGES", "5"}},
+                                      0, 0, 0, false);
+    const Reconstruction preset_s = run({{"SS_SFM_TIE_PRESET", "1"}}, 0, 1, 60, false);
+    struct Row { const char* name; const Reconstruction* m; } rows[] = {
+        {"split", &split}, {"off", &off}, {"N=3", &n3}, {"N=3 1 s cross", &sec},
+        {"N=3 1 s no cross", &sec0}, {"N=3 0.05 s cross", &sec_short},
+        {"N=3 5 img cross", &img}, {"N=3 5 img no cross", &img0}, {"preset 5 img", &preset},
+        {"preset 1 s", &preset_s}};
+    for (const Row& r : rows)
+        printf("tie-cross: %-18s block/pre %.3f, %zu/%zu copies one point, %zu points\n", r.name,
+               blockRatio(*r.m), joinedCopies(s, *r.m), ndup, r.m->points3D.size());
+    check(sameModel(off, zero) && off.points3D.size() == zero.points3D.size(),
+          "tie cross: --tie-merge 0 is off whatever the span");
+    check(blockRatio(off) > 1.9 && joinedCopies(s, off) <= ndup / 50, "tie cross: off keeps the copies apart");
+    check(std::fabs(blockRatio(sec) - 1.0) < 0.03 && joinedCopies(s, sec) >= 0.9 * ndup,
+          "tie cross: 1 s with cross fuses the copies across the sequences");
+    check(sameModel(off, sec0) && off.points3D.size() == sec0.points3D.size(),
+          "tie cross: no cross, no tie counts across the sequences");
+    check(sameModel(off, sec_short) && off.points3D.size() == sec_short.points3D.size(),
+          "tie cross: 0.05 s (3 frames) is shorter than any cross pair");
+    check(std::fabs(blockRatio(img) - 1.0) < 0.03 && joinedCopies(s, img) >= 0.9 * ndup,
+          "tie cross: a span in images counts cross ties without limit");
+    check(sameModel(off, img0) && off.points3D.size() == img0.points3D.size(),
+          "tie cross: SS_SFM_TIE_SPAN_CROSS=0 as before (never across)");
+    check(sameModel(img, preset) && img.points3D.size() == preset.points3D.size(),
+          "tie cross: SS_SFM_TIE_PRESET=1 is N=3 keep refuse cross");
+    check(sameModel(sec, preset_s) && sec.points3D.size() == preset_s.points3D.size(),
+          "tie cross: the preset with --tie-span-seconds is N=3 with it");
+    (void)n3;
+
+    auto throws = [&](std::vector<std::pair<const char*, const char*>> env, double span_s, double fps) {
+        MapperOptions o = opt;
+        o.tie_merge = 3;
+        o.tie_span_s = span_s;
+        o.tie_fps = fps;
+        for (auto& [k, v] : env) setenv(k, v, 1);
+        bool threw = false;
+        try {
+            Mapper m(s.w.db, s.w.feats, o, {}, nullptr, &seqs);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        for (auto& [k, v] : env) unsetenv(k);
+        return threw;
+    };
+    check(throws({}, 1, 0), "tie cross: --tie-span-seconds without --tie-fps is refused");
+    check(throws({{"SS_SFM_TIE_PRESET", "1"}}, 0, 0), "tie cross: the preset without a span is refused");
+}
 #endif
 
 static int cmdSequenceTest(int argc, char** argv) {
@@ -883,6 +991,7 @@ static int cmdSequenceTest(int argc, char** argv) {
     if (gpu) testTieMerge(device);
     if (gpu) testTieSpan(device, 10);
     if (gpu) testTieSpan(device, 2);
+    if (gpu) testTieCross(device);
 #endif
     printf("%s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;

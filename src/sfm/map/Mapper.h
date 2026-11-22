@@ -264,6 +264,20 @@ struct MapperOptions {
     // Track fusion added 13 registered images and 2.4 AUC@5 on a 1146-image capture.
     // tracks.merge_max_track bounds its union length independently of seam welding.
     bool merge_tracks = true;
+    // Near-tie merge (Mapper::tieMerge) before each global BA round: fuse two points that
+    // tie_merge or more verified matches tie; 0 = off. Experimental: on ggg's production
+    // seed 3 with a 5 s span cut the scale error p95 from 9.46 % to 0.3 % (swipe-tree study).
+    int tie_merge = 0;
+    // Only matches between images at most this many seconds apart count (0 = no limit);
+    // an image's time is the frame index in its file name over tie_fps.
+    double tie_span_s = 0;
+    double tie_fps = 0;
+    // Matches across two sequences count by the same clock, which assumes all sequences
+    // share one frame index (a lens switch split from one video); off, they never count.
+    bool tie_cross = true;
+    // Off drops a fused point's observations over the error limit before the BA.
+    bool tie_keep = true;
+    std::string tie_clash = "refuse";   // refuse | resolve
     // A verified pair with seam_min_matches matches, of which the finished model explains
     // fewer than this fraction by a shared 3D point, is a seam candidate; Mapper::openSeams
     // has the rest of the rule. A canopy drone capture's seam read 0.015-0.15 against a p01 of 0.43. 0 = off.
@@ -398,6 +412,7 @@ public:
           priors_(priors && opt.use_priors ? priors : nullptr) {
         opt_.tracks.readExperiments();
         opt_.seed_essential = experimentInt("SFM_SEED_ESSENTIAL", opt_.seed_essential, 3);
+        initTieMerge();
         trace_ = MapTrace::attach();
         if (trace_) {
             std::vector<std::string> names;
@@ -5723,7 +5738,8 @@ private:
     // SS_SFM_TIE_KEEP=0 drops a fused point's observations over the error limit before
     // the BA; 1 (default) leaves them to the robust loss and the filter after it.
     // SS_SFM_TIE_SPAN_IMAGES=K: only matches between images at most K sequence positions
-    // apart (no sequence: ids) count towards N, so a revisit's matches tie nothing.
+    // apart (no sequence: ids) count towards N, so a revisit's matches tie nothing;
+    // --tie-span-seconds is the same gate in seconds (tieInSpan).
     // SS_SFM_TIE_MAXSPAN_IMAGES=M: no union whose observations lie more than M apart.
     // SS_SFM_TIE_CLASH=resolve: a union holding an image twice keeps, per such image, the
     // observation nearer the union's point (re-triangulated without them), if each part
@@ -5753,11 +5769,58 @@ private:
         return s;
     }
 
-    static int tieClashMode() {
-        const char* v = spirula::env("SFM_TIE_CLASH");
-        if (!v || std::string(v) == "refuse") return 0;
-        if (std::string(v) == "resolve") return 1;
-        throw std::invalid_argument("invalid SS_SFM_TIE_CLASH (refuse | resolve)");
+    static int tieClashMode(const std::string& v) {
+        if (v == "refuse") return 0;
+        if (v == "resolve") return 1;
+        throw std::invalid_argument("invalid tie clash mode '" + v + "' (refuse | resolve)");
+    }
+
+    // SS_SFM_TIE_PRESET=1 is --tie-merge 3 with keep, refuse and cross; it needs a span
+    // (--tie-span-seconds or SS_SFM_TIE_SPAN_IMAGES). Each SS_SFM_TIE_* knob overrides.
+    void initTieMerge() {
+        const bool preset = experimentInt("SFM_TIE_PRESET", 0, 1) == 1;
+        tie_merge_ = opt_.tie_merge;
+        tie_keep_ = opt_.tie_keep ? 1 : 0;
+        tie_cross_ = opt_.tie_cross ? 1 : 0;
+        tie_resolve_ = tieClashMode(opt_.tie_clash);
+        if (preset) {
+            if (tie_merge_ == 0) tie_merge_ = 3;
+            tie_keep_ = 1;
+            tie_cross_ = 1;
+            tie_resolve_ = 0;
+        }
+        tie_merge_ = experimentInt("SFM_TIE_MERGE", tie_merge_, 1000000);
+        tie_near_ = experimentInt("SFM_TIE_NEAR", 0, 1000000);
+        tie_keep_ = experimentInt("SFM_TIE_KEEP", tie_keep_, 1);
+        tie_span_ = experimentInt("SFM_TIE_SPAN_IMAGES", 0, 1000000);
+        tie_maxspan_ = experimentInt("SFM_TIE_MAXSPAN_IMAGES", 0, 1000000);
+        tie_cross_ = experimentInt("SFM_TIE_SPAN_CROSS", tie_cross_, 1);
+        if (const char* v = spirula::env("SFM_TIE_CLASH")) tie_resolve_ = tieClashMode(v);
+        if (opt_.tie_span_s > 0) {
+            if (!(opt_.tie_fps > 0))
+                throw std::invalid_argument("--tie-span-seconds needs --tie-fps");
+            tie_span_frames_ = opt_.tie_span_s * opt_.tie_fps;
+            tie_frame_.resize(db_.images.size());
+            for (size_t i = 0; i < db_.images.size(); i++)
+                tie_frame_[i] = nameFrameIndex(db_.images[i].name);
+        }
+        if (preset && tie_span_ == 0 && tie_span_frames_ == 0)
+            throw std::invalid_argument(
+                "SS_SFM_TIE_PRESET=1 needs --tie-span-seconds or SS_SFM_TIE_SPAN_IMAGES");
+    }
+
+    // Whether a verified match between images a and b counts towards N. Across two
+    // sequences: by time with a span in seconds, without limit with one in images.
+    bool tieInSpan(uint32_t a, uint32_t b) const {
+        const bool cross = seq_ && seq_->has(a) && seq_->has(b) &&
+                           seq_->sequenceOf(a) != seq_->sequenceOf(b);
+        if (cross && !tie_cross_ && (tie_span_frames_ > 0 || tie_span_ > 0)) return false;
+        if (tie_span_frames_ > 0) {
+            const int fa = tie_frame_[a], fb = tie_frame_[b];
+            return fa >= 0 && fb >= 0 && std::abs(fa - fb) <= tie_span_frames_;
+        }
+        if (tie_span_ > 0) return cross || tieGap(a, b) <= tie_span_;
+        return true;
     }
 
     PointObservation tieObs(const ModelIndex& mi, const TrackElement& e) const {
@@ -5831,7 +5894,7 @@ private:
                     if (q == kInvalidPoint3D || q == p) continue;
                     TieCount& k = count[(std::min(p, q) << 32) | std::max(p, q)];
                     k.all++;
-                    if (tie_span_ == 0 || tieGap(a, c.image_id) <= tie_span_) k.in++;
+                    if (tieInSpan(a, c.image_id)) k.in++;
                 }
             }
         }
@@ -5983,9 +6046,11 @@ private:
             st.candidates, st.merged, st.joined, st.clash, st.cap, st.distant, st.kept_obs,
             st.dropped_obs, st.points_before, st.points_after, st.refused_span, st.refused_maxspan,
             st.resolved_clash, st.clash_dropped);
-        slog::diag(slog::Tag::Map, "[tie] n=%d near=%d keep=%d span=%d maxspan=%d resolve=%d %s",
+        slog::diag(slog::Tag::Map,
+                   "[tie] n=%d near=%d keep=%d span=%d maxspan=%d resolve=%d cross=%d "
+                   "span_s=%.2f fps=%.3f %s",
                    tie_merge_, tie_near_, tie_keep_, tie_span_, tie_maxspan_, tie_resolve_,
-                   f.c_str());
+                   tie_cross_, opt_.tie_span_s, opt_.tie_fps, f.c_str());
         trace("tie_merge", f);
         return st;
     }
@@ -6573,12 +6638,11 @@ private:
     bool ba_requested_ = false;
     std::unordered_set<uint64_t> welded_;  // fused by fuseSeams; the next globalRefine spares them
     int refine_rounds_ = 0;                // BA rounds the last globalRefine ran
-    const int tie_merge_ = experimentInt("SFM_TIE_MERGE", 0, 1000000);  // tieMerge(); 0 = off
-    const int tie_near_ = experimentInt("SFM_TIE_NEAR", 0, 1000000);
-    const int tie_keep_ = experimentInt("SFM_TIE_KEEP", 1, 1);
-    const int tie_span_ = experimentInt("SFM_TIE_SPAN_IMAGES", 0, 1000000);     // 0 = off
-    const int tie_maxspan_ = experimentInt("SFM_TIE_MAXSPAN_IMAGES", 0, 1000000);
-    const int tie_resolve_ = tieClashMode();
+    // The tie merge's settings (initTieMerge): opt_'s, then the SS_SFM_TIE_* overrides.
+    int tie_merge_ = 0, tie_near_ = 0, tie_keep_ = 1, tie_span_ = 0, tie_maxspan_ = 0;
+    int tie_resolve_ = 0, tie_cross_ = 1;
+    double tie_span_frames_ = 0;          // tie_span_s * tie_fps, in file-name frame indices
+    std::vector<int> tie_frame_;          // per image; -1 = no frame index in the name
     // Counted from const passes that fan out over threads (the audit, the
     // seed prefetch).
     mutable std::atomic<uint32_t> prior_vouched_{0}, prior_seeds_{0};
