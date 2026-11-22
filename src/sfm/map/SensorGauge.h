@@ -18,6 +18,7 @@
 
 #include "sfm/core/Model.h"
 #include "sfm/core/Pose.h"
+#include "sfm/core/Sequence.h"
 #include "sfm/core/SensorTimeline.h"
 #include "sfm/geometry/LinAlg.h"
 #include "sfm/map/ImuExtrinsic.h"
@@ -114,15 +115,7 @@ struct SensorGaugeResult {
 
 namespace sensor_detail {
 
-inline int stemIndex(const std::string& name) {
-    size_t end = name.find_last_of('.');
-    const size_t slash = name.find_last_of('/');
-    if (end == std::string::npos || (slash != std::string::npos && end < slash)) end = name.size();
-    size_t b = end;
-    while (b > 0 && std::isdigit((unsigned char)name[b - 1])) b--;
-    if (b == end || end - b > 9) return -1;
-    return std::atoi(name.substr(b, end - b).c_str());
-}
+inline int stemIndex(const std::string& name) { return nameFrameIndex(name); }
 
 inline std::string dirOf(const std::string& name) {
     const size_t slash = name.find_last_of('/');
