@@ -1174,6 +1174,17 @@ only links at the canopy capture's seam (at most 3 per model) and nothing on the
 `SS_SFM_MAP_PROF` the models as they were before a weld are written to
 `sparse/pre_weld/` (in the mapper's frame, not the gauge's).
 
+The near-tie merge (`--tie-merge N`, experimental, off) fuses, before every global BA round, two points that N or more
+verified matches tie, whatever their reprojection; a union that would hold an image twice or pass the track cap is refused.
+`--tie-span-seconds S` with `--tie-fps F` counts only matches whose images lie at most S s apart (an image's time is the
+frame index its name ends in, over F); `--tie-cross` (on) lets those count across two sequences on one clock (a lens
+switch); `--no-tie-keep` drops a union's over-limit observations before the BA. One `[tie]` line per round has the counts.
+Measured with `--tie-merge 3 --tie-span-seconds 5`: a phone clip whose scale stepped after a pan past a tree (the tree held
+twice) went from a scale error p95 of 9.5 % to 0.1-0.3 % for the production and the end seed, a late-seeded bike ride from
+6.2 % to 0.4-0.6 %, a lens-switch clip from 117 to 124/124 images; 360-rig, sensor-gauged and healthy walks are unchanged.
+Without the span a revisit's repeated structure is fused (a long walk got worse; `sfm_sequence_test`'s revisit case
+collapses), `--no-tie-keep` undoes the merge, and a seed placed after the scale step is not repaired (it can get worse).
+
 `--mapper flat|bottom-up|global` picks the schedule (see the stage graph; flat is the
 default for every capture, and there is no size-based switch);
 `--bup-atom-size` and `--bup-overlap` size the atoms and the overlap the

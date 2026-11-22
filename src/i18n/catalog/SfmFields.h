@@ -1946,6 +1946,23 @@ SS_MSG(merge_tracks_help,
        "признаком"),
     TR("Bir karşılığın aynı öznitelik dediği iki 3B noktayı kaynaştır"));
 
+SS_MSG_EN(tie_merge_help,
+    "Before each global BA round, fuse two 3D points that this many verified matches tie.\n"
+    "Experimental. 0 disables");
+
+SS_MSG_EN(tie_span_seconds_help,
+    "Only matches between images at most this many seconds apart count for --tie-merge.\n"
+    "Needs --tie-fps. 0 disables the limit");
+
+SS_MSG_EN(tie_fps_help,
+    "Frame rate that turns the frame number in an image name into seconds, for --tie-span-seconds");
+
+SS_MSG_EN(tie_cross_help,
+    "Count matches across two sequences for --tie-span-seconds by the same clock (one video, split by lens)");
+
+SS_MSG_EN(tie_keep_help,
+    "Keep a fused point's observations over the error limit for the BA's robust loss (--tie-merge)");
+
 SS_MSG(seam_weld_help,
     EN("Welds and refines open seams from verified pairs with 100+ matches.\nRequires few shared neighbors and a match fraction below this threshold in the finished model. 0 disables."),
     JA("開いた継ぎ目を結合します。検証済みの対応が 100 以上あり、完成したモデルがこの割合未満しか説明できず、共通の近傍画像がほとんどない画像対を融合して再調整します。\n0 で省略"),

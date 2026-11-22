@@ -543,6 +543,16 @@ struct SfmConfig {
       retri_scale)                                                                                 \
     F(mapper.merge_tracks, "merge-tracks", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0, 0, "", \
       merge_tracks)                                                                                \
+    F(mapper.tie_merge, "tie-merge", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0, 1000000, "", \
+      tie_merge)                                                                                   \
+    F(mapper.tie_span_s, "tie-span-seconds", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper",         \
+      0, 3600, "", tie_span_seconds)                                                               \
+    F(mapper.tie_fps, "tie-fps", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0, 100000, "",      \
+      tie_fps)                                                                                     \
+    F(mapper.tie_cross, "tie-cross", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0, 0, "",       \
+      tie_cross)                                                                                   \
+    F(mapper.tie_keep, "tie-keep", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0, 0, "",         \
+      tie_keep)                                                                                    \
     F(mapper.seam_weld_frac, "seam-weld", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0, 1, "",  \
       seam_weld)                                                                                   \
     F(mapper.gps_scale_band, "gps-scale-band", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0, 1, \

@@ -263,6 +263,19 @@ struct MapperOptions {
     // Track fusion added 13 registered images and 2.4 AUC@5 on a 1146-image capture.
     // tracks.merge_max_track bounds its union length independently of seam welding.
     bool merge_tracks = true;
+    // Near-tie merge (Mapper::tieMerge) before each global BA round: fuse two points that
+    // tie_merge or more verified matches tie; 0 = off. On a phone clip whose scale stepped
+    // after a pan, 3 with a 5 s span took the scale error p95 from 9.5 % to 0.3 %.
+    int tie_merge = 0;
+    // Only matches between images at most this many seconds apart count (0 = no limit);
+    // an image's time is the frame index in its file name over tie_fps.
+    double tie_span_s = 0;
+    double tie_fps = 0;
+    // With a span, matches across two sequences count by the same clock, which assumes all
+    // sequences share one frame index (a lens switch split from one video); off, never.
+    bool tie_cross = true;
+    // Off drops a fused point's observations over the error limit before the BA.
+    bool tie_keep = true;
     // A verified pair with seam_min_matches matches, of which the finished model explains
     // fewer than this fraction by a shared 3D point, is a seam candidate; Mapper::openSeams
     // has the rest of the rule. A canopy drone capture's seam read 0.015-0.15 against a p01 of 0.43. 0 = off.
@@ -397,6 +410,7 @@ public:
           priors_(priors && opt.use_priors ? priors : nullptr) {
         opt_.tracks.readExperiments();
         opt_.seed_essential = experimentInt("SFM_SEED_ESSENTIAL", opt_.seed_essential, 3);
+        initTieMerge();
     }
 
     const RigTable* rigs() const { return rigs_; }
@@ -5456,6 +5470,7 @@ private:
                 ProfTimer pt(g_map_prof.retri);
                 track_changes = completeAndRetriangulate();
             }
+            if (opt_.tie_merge > 0) tieMerge(i + 1);
             size_t before = countObservations();
             BundleOptions bo;
             bo.real = realCfgFromName(opt_.ba_real);
@@ -5645,6 +5660,170 @@ private:
             }
         }
         return 0;
+    }
+
+    // --tie-merge N (src/sfm/README.md): fuse point pairs that N or more verified matches tie,
+    // strongest first, refusing unions that hold an image twice or pass the track cap; the
+    // union is re-triangulated from all its observations and the BA judges them.
+    struct TieStats {
+        size_t linked = 0, candidates = 0, refused_span = 0, merged = 0, joined = 0, clash = 0,
+               cap = 0, kept_obs = 0, dropped_obs = 0, points_before = 0, points_after = 0;
+    };
+
+    void initTieMerge() {
+        if (opt_.tie_merge <= 0 || opt_.tie_span_s <= 0) return;
+        if (!(opt_.tie_fps > 0)) throw std::invalid_argument("--tie-span-seconds needs --tie-fps");
+        tie_span_frames_ = opt_.tie_span_s * opt_.tie_fps;
+        tie_frame_.resize(db_.images.size());
+        for (size_t i = 0; i < db_.images.size(); i++)
+            tie_frame_[i] = nameFrameIndex(db_.images[i].name);
+    }
+
+    // Whether a verified match between images a and b counts towards N.
+    bool tieInSpan(uint32_t a, uint32_t b) const {
+        if (tie_span_frames_ <= 0) return true;
+        const bool cross = seq_ && seq_->has(a) && seq_->has(b) &&
+                           seq_->sequenceOf(a) != seq_->sequenceOf(b);
+        if (cross && !opt_.tie_cross) return false;
+        const int fa = tie_frame_[a], fb = tie_frame_[b];
+        return fa >= 0 && fb >= 0 && std::abs(fa - fb) <= tie_span_frames_;
+    }
+
+    TieStats tieMerge(int round) {
+        TieStats st;
+        st.points_before = rec_.points3D.size();
+        ModelIndex mi = indexModel();
+        const uint32_t n = (uint32_t)db_.images.size();
+        std::vector<uint8_t> reg(n, 0);
+        for (uint32_t i = 0; i < n; i++) reg[i] = mi.img[i] && mi.img[i]->registered;
+        struct TieCount { uint32_t all = 0, in = 0; };  // matches; those within the span
+        std::unordered_map<uint64_t, TieCount> count;
+        for (uint32_t a = 0; a < n; a++) {
+            if (!reg[a]) continue;
+            const std::vector<uint64_t>& ids = mi.img[a]->point3D_ids;
+            for (uint32_t f = 0; f < (uint32_t)ids.size(); f++) {
+                const uint64_t p = ids[f];
+                if (p == kInvalidPoint3D) continue;
+                for (const Correspondence& c : graph_.at(a, f)) {
+                    if (c.image_id <= a || !reg[c.image_id]) continue;
+                    const uint64_t q = mi.img[c.image_id]->point3D_ids[c.feature_idx];
+                    if (q == kInvalidPoint3D || q == p) continue;
+                    TieCount& k = count[(std::min(p, q) << 32) | std::max(p, q)];
+                    k.all++;
+                    if (tieInSpan(a, c.image_id)) k.in++;
+                }
+            }
+        }
+        st.linked = count.size();
+        struct Tie { uint32_t n; uint64_t p, q; };
+        std::vector<Tie> ties;
+        for (const auto& kv : count)
+            if (kv.second.in >= (uint32_t)opt_.tie_merge)
+                ties.push_back({kv.second.in, kv.first >> 32, kv.first & 0xffffffffull});
+            else if (kv.second.all >= (uint32_t)opt_.tie_merge)
+                st.refused_span++;
+        std::sort(ties.begin(), ties.end(), [](const Tie& x, const Tie& y) {
+            return x.n != y.n ? x.n > y.n : x.p != y.p ? x.p < y.p : x.q < y.q;
+        });
+        st.candidates = ties.size();
+
+        std::unordered_map<uint64_t, uint64_t> into;
+        auto find = [&](uint64_t id) {
+            uint64_t r = id;
+            for (auto it = into.find(r); it != into.end(); it = into.find(r)) r = it->second;
+            for (uint64_t k = id; k != r;) {
+                uint64_t& next = into[k];
+                k = std::exchange(next, r);
+            }
+            return r;
+        };
+        std::map<uint64_t, std::vector<Vec3>> starts;  // survivor -> its parts' positions
+        std::vector<uint8_t> on_track(n, 0);
+        for (const Tie& t : ties) {
+            uint64_t a = find(t.p), b = find(t.q);
+            if (a == b) { st.joined++; continue; }
+            Point3D* A = &rec_.points3D.at(a);
+            Point3D* B = &rec_.points3D.at(b);
+            if (!opt_.tracks.allowsMerge(A->track.size(), B->track.size())) { st.cap++; continue; }
+            for (const TrackElement& e : A->track) on_track[e.image_id] = 1;
+            bool clash = false;
+            for (const TrackElement& e : B->track) clash = clash || on_track[e.image_id];
+            for (const TrackElement& e : A->track) on_track[e.image_id] = 0;
+            if (clash) { st.clash++; continue; }
+            if (B->track.size() > A->track.size()) {
+                std::swap(a, b);
+                std::swap(A, B);
+            }
+            std::vector<Vec3>& sa = starts[a];
+            if (sa.empty()) sa.push_back(A->xyz);
+            auto sb = starts.find(b);
+            if (sb == starts.end()) {
+                sa.push_back(B->xyz);
+            } else {
+                sa.insert(sa.end(), sb->second.begin(), sb->second.end());
+                starts.erase(sb);
+            }
+            for (const TrackElement& e : B->track) {
+                mi.img[e.image_id]->point3D_ids[e.point2D_idx] = a;
+                A->track.push_back(e);
+            }
+            rec_.points3D.erase(b);
+            into[b] = a;
+            st.merged++;
+        }
+
+        const double err = opt_.max_reproj_error;
+        for (auto& kv : starts) {
+            Point3D& pt = rec_.points3D.at(kv.first);
+            std::vector<PointObservation> obs;
+            obs.reserve(pt.track.size());
+            for (const TrackElement& e : pt.track)
+                obs.push_back({poseToP(mi.img[e.image_id]->pose),
+                               mi.cam[e.image_id]->bearing(kp(e.image_id, e.point2D_idx)),
+                               mi.cam[e.image_id]->errRad(err)});
+            double best = std::numeric_limits<double>::infinity();
+            for (const Vec3& s : kv.second) {
+                const Vec3 x = refineTriangulatedPoint(s, obs, 20);
+                const double c = pointAngularCost(x, obs);
+                if (c < best) {
+                    best = c;
+                    pt.xyz = x;
+                }
+            }
+            if (opt_.tie_keep) {
+                st.kept_obs += pt.track.size();
+                continue;
+            }
+            size_t keep = 0;
+            for (const TrackElement& e : pt.track) {
+                if (reprojErrAt(mi, e.image_id, e.point2D_idx, pt.xyz) <=
+                    err * mi.pixel_scale[e.image_id]) {
+                    pt.track[keep++] = e;
+                } else {
+                    mi.img[e.image_id]->point3D_ids[e.point2D_idx] = kInvalidPoint3D;
+                    st.dropped_obs++;
+                }
+            }
+            pt.track.resize(keep);
+            if (keep < 2) {
+                for (const TrackElement& e : pt.track)
+                    mi.img[e.image_id]->point3D_ids[e.point2D_idx] = kInvalidPoint3D;
+                st.dropped_obs += keep;
+                rec_.points3D.erase(kv.first);
+            } else {
+                st.kept_obs += keep;
+            }
+        }
+        st.points_after = rec_.points3D.size();
+        slog::diag(slog::Tag::Map,
+                   "[tie] n=%d keep=%d cross=%d span_s=%.2f fps=%.3f round=%d linked=%zu "
+                   "candidates=%zu refused_span=%zu merged=%zu joined=%zu clash=%zu cap=%zu "
+                   "kept_obs=%zu dropped_obs=%zu points_before=%zu points_after=%zu",
+                   opt_.tie_merge, (int)opt_.tie_keep, (int)opt_.tie_cross, opt_.tie_span_s,
+                   opt_.tie_fps, round, st.linked, st.candidates, st.refused_span, st.merged,
+                   st.joined, st.clash, st.cap, st.kept_obs, st.dropped_obs, st.points_before,
+                   st.points_after);
+        return st;
     }
 
     // Does some pair of views of `a` + `b` see `x` from far enough apart to fix
@@ -6216,6 +6395,8 @@ private:
     bool ba_requested_ = false;
     std::unordered_set<uint64_t> welded_;  // fused by fuseSeams; the next globalRefine spares them
     int refine_rounds_ = 0;                // BA rounds the last globalRefine ran
+    double tie_span_frames_ = 0;  // tie_span_s * tie_fps, in file-name frame indices
+    std::vector<int> tie_frame_;  // per image (initTieMerge); -1 = no frame index in the name
     // Counted from const passes that fan out over threads (the audit, the
     // seed prefetch).
     mutable std::atomic<uint32_t> prior_vouched_{0}, prior_seeds_{0};
