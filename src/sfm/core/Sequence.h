@@ -21,6 +21,17 @@ namespace sfm {
 
 constexpr int32_t kNoSequence = -1;
 
+// The frame index a video frame's file name ends in (cam0/00412.jpg: 412); -1 = none.
+inline int nameFrameIndex(const std::string& name) {
+    size_t end = name.find_last_of('.');
+    const size_t slash = name.find_last_of('/');
+    if (end == std::string::npos || (slash != std::string::npos && end < slash)) end = name.size();
+    size_t b = end;
+    while (b > 0 && name[b - 1] >= '0' && name[b - 1] <= '9') b--;
+    if (b == end || end - b > 9) return -1;
+    return std::atoi(name.substr(b, end - b).c_str());
+}
+
 struct SequenceDef {
     std::vector<std::string> members;   // path prefixes; "" is the whole dataset
 };
