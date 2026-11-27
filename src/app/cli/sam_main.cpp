@@ -586,6 +586,11 @@ int cmd_track(const Options& o) {
         std::fprintf(stderr, "%s\n", cmsg::sam_track_needs.get());
         return 2;
     }
+    if (o.follow && o.overlay) {
+        std::fprintf(stderr, "%s\n",
+                     format(cmsg::error_line, {"--follow does not write --overlay"}).c_str());
+        return 2;
+    }
     if (!app::require_model_license(o.model)) return 2;
     std::vector<std::string> files;
     if (!o.follow) {
@@ -704,6 +709,7 @@ int cmd_track(const Options& o) {
         if (!masker.run(frame, mask, o.overlay ? &r : nullptr, (int64_t)f)) {
             std::fprintf(stderr, "%s\n",
                          format(cmsg::error_line, {masker.lastError()}).c_str());
+            if (write) report(false, stem);
             return 1;
         }
         t_track += nn::now_ms() - t0;
@@ -730,12 +736,7 @@ int cmd_track(const Options& o) {
             const std::string path =
                 (fs::path(o.out_dir) / (o.follow ? stem + ".png" : numbered)).string();
             if (o.overlay) {
-                const std::string part = app::atomic_temp_path(path);
-                bool ok = sam::save_overlay_png(frame, r, part);
-                if (ok) fs::rename(part, path, dec);
-                ok = ok && !dec;
-                if (!ok) fs::remove(part, dec);
-                report(ok, stem);
+                sam::save_overlay_png(frame, r, path);
             } else {
                 app::turn_pixels(app::inverse_turn(loaded.turn), 1, mask.data,
                                  mask.width, mask.height);

@@ -21,11 +21,21 @@
 #include "sam/Sam.h"
 #include "sfm/core/Exif.h"
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <signal.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -53,19 +63,49 @@ struct WriteJob {
     std::function<void(bool)> done;
 };
 
-// ".<name>.tmp" beside `path`: hidden, and no glob for the real extension matches it.
-inline std::string atomic_temp_path(const std::string& path) {
-    const std::filesystem::path p(path);
-    return (p.parent_path() / ("." + p.filename().string() + ".tmp")).string();
+inline long current_pid() {
+#ifdef _WIN32
+    return (long)_getpid();
+#else
+    return (long)getpid();
+#endif
 }
 
-// Removes what an interrupted run left under atomic_temp_path names in `dir`.
+// ".<name>.<pid>.tmp" beside `path`: hidden, and no glob for the real
+// extension matches it.
+inline std::string atomic_temp_path(const std::string& path) {
+    const std::filesystem::path p(path);
+    return (p.parent_path() / ("." + p.filename().string() + "." +
+                               std::to_string(current_pid()) + ".tmp")).string();
+}
+
+// Removes the atomic_temp_path files of a .jpg/.png/.jpeg that a process no
+// longer running left in `dir`. Windows has no cheap liveness test without
+// <windows.h>, so there a temp counts as dead after ten minutes.
 inline void remove_atomic_temps(const std::string& dir) {
+    namespace fs = std::filesystem;
     std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
         const std::string n = e.path().filename().string();
-        if (n.size() > 5 && n[0] == '.' && n.compare(n.size() - 4, 4, ".tmp") == 0)
-            std::filesystem::remove(e.path(), ec);
+        if (n.size() < 8 || n[0] != '.' || n.compare(n.size() - 4, 4, ".tmp") != 0) continue;
+        const std::string body = n.substr(1, n.size() - 5);   // <name>.<pid>
+        const size_t dot = body.rfind('.');
+        if (dot == std::string::npos || dot + 1 == body.size() ||
+            body.find_first_not_of("0123456789", dot + 1) != std::string::npos)
+            continue;
+        const std::string name = body.substr(0, dot);
+        const size_t ext = name.rfind('.');
+        const std::string x = ext == std::string::npos ? "" : name.substr(ext);
+        if (x != ".jpg" && x != ".png" && x != ".jpeg") continue;
+        const long pid = std::atol(body.c_str() + dot + 1);
+        if (pid == current_pid()) continue;
+#ifdef _WIN32
+        const auto age = fs::file_time_type::clock::now() - fs::last_write_time(e.path(), ec);
+        if (ec || age < std::chrono::minutes(10)) continue;
+#else
+        if (::kill((pid_t)pid, 0) == 0 || errno == EPERM) continue;
+#endif
+        fs::remove(e.path(), ec);
     }
 }
 

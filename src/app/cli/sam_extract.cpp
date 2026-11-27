@@ -318,51 +318,69 @@ bool parse_args(int argc, char** argv, Options& o) {
     return true;
 }
 
-// The --progress file: JSON lines, at most one each kInterval, the last one
-// always (app/FrameStream.h, frame_progress_line).
+// The --progress file: JSON lines, at most one each kInterval, written by a
+// thread of its own so a writer thread reporting a frame never waits on it.
 class ProgressFile {
 public:
     bool open(const std::string& path) {
+        std::error_code ec;
+        const fs::path dir = fs::path(path).parent_path();
+        if (!dir.empty()) fs::create_directories(dir, ec);
         f_ = std::fopen(path.c_str(), "w");
         if (!f_) return false;
         flusher_ = std::thread([this] {
             std::unique_lock<std::mutex> lk(mu_);
-            while (!stop_) {
-                cv_.wait_for(lk, kInterval);
-                if (!pending_.empty() && Clock::now() - last_ >= kInterval) write(false);
+            for (;;) {
+                cv_.wait(lk, [&] { return stop_ || !pending_.empty(); });
+                if (stop_) return;
+                cv_.wait_until(lk, last_ + kInterval, [&] { return stop_; });
+                if (stop_) return;
+                flush(lk, {});
             }
         });
         return true;
     }
-    void landed(const std::vector<std::string>& stems) {
+    void landed(const std::vector<app::FrameLanded>& frames) {
         std::lock_guard<std::mutex> lk(mu_);
-        pending_.insert(pending_.end(), stems.begin(), stems.end());
-        written_ += (int64_t)stems.size();
-        if (Clock::now() - last_ >= kInterval) write(false);
+        for (const app::FrameLanded& f : frames) {
+            pending_.push_back(f);
+            if (!f.rejected) ++written_;
+        }
+        cv_.notify_one();
     }
-    // `done` only for a run that wrote everything it chose.
-    void close(bool done) {
-        if (!f_) return;
+    // The last line: done with the decoder, or not done with the reason. False
+    // when the file could not be written, which is never done.
+    bool close(const std::string& error, const std::string& decoder) {
+        if (!f_) return true;
         {
             std::lock_guard<std::mutex> lk(mu_);
             stop_ = true;
         }
         cv_.notify_all();
         flusher_.join();
-        if (done || !pending_.empty()) write(done);
-        std::fclose(f_);
+        std::unique_lock<std::mutex> lk(mu_);
+        const std::string why = failed_ ? "could not write the progress file" : error;
+        flush(lk, why.empty() ? ",\"done\":true,\"decoder\":" + json_quote(decoder)
+                              : ",\"done\":false,\"error\":" + json_quote(why));
+        const bool closed = std::fclose(f_) == 0;
         f_ = nullptr;
+        return closed && !failed_;
     }
-    ~ProgressFile() { close(false); }
+    ~ProgressFile() { close("stopped", ""); }
 
 private:
     using Clock = std::chrono::steady_clock;
     static constexpr std::chrono::milliseconds kInterval{250};
-    void write(bool done) {
-        const std::string line = app::frame_progress_line(written_, pending_, done);
-        std::fwrite(line.data(), 1, line.size(), f_);
-        std::fflush(f_);
-        pending_.clear();
+    void flush(std::unique_lock<std::mutex>& lk, const std::string& tail) {
+        std::vector<app::FrameLanded> frames;
+        frames.swap(pending_);
+        const int64_t written = written_;
+        lk.unlock();
+        const std::string line = app::frame_progress_line(written, frames, tail);
+        const bool ok = std::fwrite(line.data(), 1, line.size(), f_) == line.size() &&
+                        std::fflush(f_) == 0;
+        lk.lock();
+        if (!ok) failed_ = true;
         last_ = Clock::now();
     }
 
@@ -370,10 +388,10 @@ private:
     std::thread flusher_;
     std::mutex mu_;
     std::condition_variable cv_;
-    std::vector<std::string> pending_;
+    std::vector<app::FrameLanded> pending_;
     int64_t written_ = 0;
     Clock::time_point last_{};
-    bool stop_ = false;
+    bool stop_ = false, failed_ = false;
 };
 
 }  // namespace
@@ -393,7 +411,21 @@ int sam_cli_extract(int argc, char** argv) {
     if (o.validate) set_env("SS_VK_VALIDATION", "1");
     if (o.profile) set_env("SS_PROFILE", "1");
 
-    if (!o.model.empty() && !app::require_model_license(o.model)) return 2;
+    // Opened first, so a reader learns of every failure from its last line.
+    ProgressFile progress;
+    if (!o.progress.empty() && !progress.open(o.progress)) {
+        std::fprintf(stderr, "%s\n",
+                     spirula::i18n::format(spirula::i18n::msg::cli::error_line,
+                                           {"could not write " + o.progress}).c_str());
+        return 1;
+    }
+    auto fail = [&](int rc, const std::string& why) {
+        progress.close(why, "");
+        return rc;
+    };
+
+    if (!o.model.empty() && !app::require_model_license(o.model))
+        return fail(2, "the model's licence is not accepted");
 
     const fs::path input(o.input);
     const fs::path base = o.out_dir.empty()
@@ -427,8 +459,9 @@ int sam_cli_extract(int argc, char** argv) {
     job.similar_bits = o.similar;
     job.skipped_dir = o.skipped_dir;
     job.threads = o.threads;
+    app::FramePlan plan_in;
     if (!o.plan_in.empty()) {
-        app::FramePlan plan;
+        app::FramePlan& plan = plan_in;
         std::string err;
         if (app::read_frame_plan(o.plan_in, plan, err)) {
             if (plan.keep != o.keep)
@@ -441,7 +474,7 @@ int sam_cli_extract(int argc, char** argv) {
             std::fprintf(stderr, "%s\n",
                          spirula::i18n::format(spirula::i18n::msg::cli::error_line,
                                                {err}).c_str());
-            return 2;
+            return fail(2, err);
         }
         job.plan = plan.ends;
         job.keep_existing = true;
@@ -513,7 +546,7 @@ int sam_cli_extract(int argc, char** argv) {
             std::fprintf(stderr, "%s\n",
                          spirula::i18n::format(spirula::i18n::msg::cli::sam_report_unwritable,
                                                {o.report}).c_str());
-            return 1;
+            return fail(1, "could not write " + o.report);
         }
     }
     if (report) {
@@ -525,35 +558,32 @@ int sam_cli_extract(int argc, char** argv) {
         };
     }
 
-    for (const std::string& f : {o.plan_out, o.progress}) {
-        std::error_code ec;
-        const fs::path dir = fs::path(f).parent_path();
-        if (!f.empty() && !dir.empty()) fs::create_directories(dir, ec);
-    }
-    // A reader waiting on a plan that never comes would wait forever.
+    // A reader waiting on a plan that never comes would wait forever, and a
+    // resumed run on another plan would give a window a second frame.
     std::string plan_error;
     std::atomic<bool> stop{false};
-    if (!o.plan_out.empty()) {
+    if (!o.plan_out.empty() || !o.plan_in.empty()) {
         sinks.cancel = &stop;
         sinks.layout = [&](const app::FramePlan& p) {
-            if (app::write_text_atomic(o.plan_out, app::frame_plan_json(p), plan_error))
-                return;
+            if (!o.plan_in.empty()) {
+                const std::string why = app::frame_plan_mismatch(plan_in, p);
+                if (!why.empty()) plan_error = o.plan_in + ": " + why;
+            }
+            if (plan_error.empty() && !o.plan_out.empty()) {
+                std::error_code ec;
+                const fs::path dir = fs::path(o.plan_out).parent_path();
+                if (!dir.empty()) fs::create_directories(dir, ec);
+                app::write_text_atomic(o.plan_out, app::frame_plan_json(p), plan_error);
+            }
+            if (plan_error.empty()) return;
             std::fprintf(stderr, "%s\n",
                          spirula::i18n::format(spirula::i18n::msg::cli::error_line,
                                                {plan_error}).c_str());
             stop = true;
         };
     }
-    ProgressFile progress;
-    if (!o.progress.empty()) {
-        if (!progress.open(o.progress)) {
-            std::fprintf(stderr, "%s\n",
-                         spirula::i18n::format(spirula::i18n::msg::cli::error_line,
-                                               {"could not write " + o.progress}).c_str());
-            return 1;
-        }
-        sinks.landed = [&](const std::vector<std::string>& stems) { progress.landed(stems); };
-    }
+    if (!o.progress.empty())
+        sinks.landed = [&](const std::vector<app::FrameLanded>& f) { progress.landed(f); };
 
     app::FrameExtractStats stats;
     std::string error;
@@ -567,8 +597,6 @@ int sam_cli_extract(int argc, char** argv) {
     if (report) std::fclose(report);
     std::printf("%s", app::format_extract_stats(stats, base.string(),
                                                 !o.model.empty()).c_str());
-    // Machine-readable and English in every language, for a script.
-    std::printf("decoder: %s\n", stats.builtin_decoder ? "vulkan" : "ffmpeg");
     if (stats.write_failures) {
         std::fprintf(stderr, "%s %s\n",
                      spirula::i18n::msg::data::word_warning.get(),
@@ -577,7 +605,13 @@ int sam_cli_extract(int argc, char** argv) {
                          {stats.write_failures}).c_str());
         rc = 1;
     }
-    if (!plan_error.empty()) rc = 1;
-    progress.close(rc == 0);
+    std::string why = !plan_error.empty() ? plan_error : error;
+    const bool streaming = !o.progress.empty() || !o.plan_out.empty();
+    if (why.empty() && stats.write_failures)
+        why = std::to_string(stats.write_failures) + " files could not be written";
+    if (why.empty() && streaming && stats.mask_failures)
+        why = std::to_string(stats.mask_failures) + " frames could not be masked";
+    if (!why.empty()) rc = 1;
+    if (!progress.close(why, stats.builtin_decoder ? "vulkan" : "ffmpeg")) rc = 1;
     return rc;
 }

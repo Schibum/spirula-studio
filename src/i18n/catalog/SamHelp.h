@@ -445,35 +445,39 @@ SS_MSG(trk_max_frames,
     TR("n kareden sonra dur"));
 
 SS_MSG(trk_follow,
-    EN("read frame paths from stdin, one a line, instead of --frames; name "
-       "each mask after its frame and print done <stem> once it is written"),
-    JA("--frames の代わりに標準入力からフレームのパスを 1 行ずつ読みます。マスクはフレームの名前で書き、書き終えると done <stem> を出力します"),
-    ZH_HANS("从标准输入逐行读取帧路径以代替 --frames；遮罩以其帧命名，写完后输出 done <stem>"),
-    ZH_HANT("從標準輸入逐行讀取影格路徑以代替 --frames；遮罩以其影格命名，寫完後輸出 done <stem>"),
-    KO("--frames 대신 표준 입력에서 프레임 경로를 한 줄씩 읽습니다. 마스크는 "
-       "프레임 이름으로 쓰고, 다 쓰면 done <stem> 을 출력합니다"),
-    DE("liest Bildpfade zeilenweise von stdin statt --frames; benennt jede "
-       "Maske nach ihrem Bild und gibt done <stem> aus, sobald sie steht"),
+    EN("read frame paths from stdin, one per line, instead of --frames; name"
+       " each mask after its frame and print done <stem>, or failed <stem> and"
+       " exit with 1"),
+    JA("--frames の代わりに標準入力からフレームのパスを 1 行に 1 つ読みます。マスクはフレームの名前で書き、done <stem> を出力します。失敗は failed <stem> で、終了コードは 1"),
+    ZH_HANS("从标准输入每行读取一个帧路径以代替 --frames；遮罩以其帧命名并输出 done <stem>；失败时输出 failed <stem>，退出码为 1"),
+    ZH_HANT("從標準輸入每行讀取一個影格路徑以代替 --frames；遮罩以其影格命名並輸出 done <stem>；失敗時輸出 failed <stem>，結束碼為 1"),
+    KO("--frames 대신 표준 입력에서 한 줄에 하나씩 프레임 경로를 읽습니다. 마스크는 "
+       "프레임 이름으로 쓰고 done <stem> 을, 실패하면 failed <stem> 을 출력하고 1 로 "
+       "끝납니다"),
+    DE("liest Bildpfade von stdin, einen pro Zeile, statt --frames; benennt "
+       "jede Maske nach ihrem Bild und gibt done <stem> aus, oder failed "
+       "<stem> und endet mit 1"),
     FR("lit les chemins des images sur stdin, un par ligne, au lieu de "
        "--frames ; nomme chaque masque d'après son image et affiche done "
-       "<stem> une fois écrit"),
+       "<stem>, ou failed <stem> et sort avec 1"),
     ES("lee las rutas de los fotogramas de stdin, una por línea, en vez de "
        "--frames; nombra cada máscara como su fotograma e imprime done "
-       "<stem> al escribirla"),
+       "<stem>, o failed <stem> y sale con 1"),
     PT("lê os caminhos dos quadros do stdin, um por linha, em vez de "
        "--frames; nomeia cada máscara como o seu quadro e imprime done "
-       "<stem> ao gravá-la"),
-    IT("legge i percorsi dei fotogrammi da stdin, uno per riga, invece di "
-       "--frames; chiama ogni maschera come il suo fotogramma e stampa done"
-       " <stem> appena scritta"),
+       "<stem>, ou failed <stem> e sai com 1"),
+    IT("legge da stdin un percorso per riga invece di --frames; chiama "
+       "ogni maschera come il suo fotogramma e stampa done <stem>, o failed "
+       "<stem> ed esce con 1"),
     NL("leest beeldpaden van stdin, één per regel, in plaats van --frames; "
-       "noemt elk masker naar zijn beeld en drukt done <stem> af zodra het "
-       "geschreven is"),
+       "noemt elk masker naar zijn beeld en drukt done <stem> af, of failed "
+       "<stem> en stopt met 1"),
     RU("читает пути кадров из stdin по одному в строке вместо --frames; "
-       "называет маску по её кадру и печатает done <stem>, когда она "
-       "записана"),
-    TR("--frames yerine kare yollarını stdin'den satır satır okur; her "
-       "maskeye karesinin adını verir ve yazılınca done <stem> basar"));
+       "называет маску по её кадру и печатает done <stem> или failed <stem> "
+       "с кодом выхода 1"),
+    TR("--frames yerine kare yollarını stdin'den satır başına bir tane okur; "
+       "her maskeye karesinin adını verir ve done <stem> basar, ya da failed "
+       "<stem> basıp 1 ile çıkar"));
 
 SS_MSG(trk_prime,
     EN("with --follow: track this frame first to fill the memory; its mask "
