@@ -43,6 +43,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -798,6 +799,160 @@ int install_model(const std::string& id, bool depth, bool normal) {
     return 0;
 }
 
+struct Todo {
+    int64_t i = 0;
+    std::filesystem::path np, dp;
+    bool normal = false, depth = false;
+    // `key` is the source's hash, then `key_rest`. Empty until hashed: a
+    // map that is not on disk is redone whatever the key, so its frame
+    // is hashed when it is read rather than before the first one runs.
+    std::string key, key_rest;
+};
+
+std::string normal_key_of(const std::string& key, const Options& o) {
+    return key + "|normal|" + o.normal_format + "|" + std::to_string(o.jpeg_quality);
+}
+
+struct BatchFrame {
+    size_t j = 0;
+    sfm::ExifTransform back;
+    size_t first = 0;   // its first face in the batch's requests
+};
+
+// Wall time per written frame, so the ETA includes the reads, the host half
+// and the writers' back-pressure, not only the network.
+struct Progress {
+    int64_t written = 0, skipped = 0, total = 0;
+    double t_start = 0;
+    bool quiet = false;
+    void frame_done(size_t remaining) {
+        ++written;
+        if (quiet) return;
+        const double each = (nn::now_ms() - t_start) / (double)written;
+        std::printf("%s\n", format(G::log_progress,
+                                   {(long long)(written + skipped), (long long)total,
+                                    (long long)std::lround(each),
+                                    format_duration(each * (double)remaining / 1000.0)})
+                                .c_str());
+        std::fflush(stdout);
+    }
+};
+
+// One batch's host half: finish the predictions, turn each face back, blend
+// the faces into the camera and queue both maps. Runs on its own thread while
+// the device works on the next batch.
+void finish_batch(const Options& o, const app::GeometryModel& pred,
+                  std::shared_ptr<const app::GeometryWarp> warp_ref,
+                  const std::vector<Todo>& todo, const std::vector<std::string>& keys,
+                  std::vector<BatchFrame> frames, std::vector<app::GeometryRequest> reqs,
+                  app::GeometryModel::Finish finish, app::WriterPool& writers,
+                  Progress& progress) {
+    const app::GeometryWarp& warp = *warp_ref;
+    std::vector<app::GeometryPrediction> preds =
+        finish ? finish() : std::vector<app::GeometryPrediction>();
+    NN_CHECK(preds.size() == reqs.size(), "the network returned %zu of %zu faces",
+             preds.size(), reqs.size());
+
+    for (const BatchFrame& f : frames) {
+        const size_t j = f.j;
+        const fs::path& np = todo[j].np;
+        const fs::path& dp = todo[j].dp;
+        const bool need_normal = todo[j].normal;
+        const bool need_depth = todo[j].depth;
+        const sfm::ExifTransform& back = f.back;
+        std::vector<std::vector<float>> face_depth, face_normal, face_mask;
+        for (int k = 0; k < warp.faces(); ++k) {
+            app::GeometryPrediction& p = preds[f.first + (size_t)k];
+            const app::GeometryRequest& rq = reqs[f.first + (size_t)k];
+            NN_CHECK(p.width == rq.width && p.height == rq.height,
+                     "the network returned %dx%d for a %dx%d face", p.width,
+                     p.height, rq.width, rq.height);
+            const size_t pixels = (size_t)p.width * p.height;
+            NN_CHECK((!need_depth || p.depth.size() == pixels) &&
+                     (!need_normal || p.normal.size() == pixels * 3) &&
+                     (p.mask.empty() || p.mask.size() == pixels),
+                     "the network returned incomplete geometry for face %d", k);
+            int dw = p.width, dh = p.height;
+            app::turn_pixels(back, 1, p.depth, dw, dh);
+            dw = p.width;
+            dh = p.height;
+            app::turn_pixels(back, 1, p.mask, dw, dh);
+            dw = p.width;
+            dh = p.height;
+            app::turn_normals(back, p.normal, dw, dh);
+            p.width = warp.faceWidth(k);
+            p.height = warp.faceHeight(k);
+            // Millimetres on every face before they are blended: Metric3D's
+            // depth is canonical to the face's own focal.
+            const float mm = (float)pred.depthToMillimetres(warp.faceFocal(k));
+            for (float& d : p.depth) d *= mm;
+            face_depth.push_back(std::move(p.depth));
+            face_normal.push_back(std::move(p.normal));
+            face_mask.push_back(std::move(p.mask));
+        }
+
+        const bool ray = o.ray_depth == Tri::Auto ? warp.defaultRayDepth()
+                                                  : o.ray_depth == Tri::Yes;
+        std::vector<float> depth, normal;
+        warp.gather(face_depth, face_normal, face_mask, ray,
+                    need_depth ? &depth : nullptr, need_normal ? &normal : nullptr);
+        NN_CHECK((!need_depth || depth.size() == (size_t)warp.outWidth() * warp.outHeight()) &&
+                 (!need_normal || normal.size() == (size_t)warp.outWidth() * warp.outHeight() * 3),
+                 "the gathered geometry is incomplete");
+
+        if (need_normal) {
+            app::WriteJob job;
+            job.path = np.string();
+            job.geometry_key = normal_key_of(keys[j], o);
+            job.geometry_overwrite = o.overwrite;
+            // A quality INSIDE 0..100 is what selects JPEG; the extension
+            // is not consulted (nn/io/Image.h). 100 wrote a JPEG called
+            // .png, which is lossy right where the mask edge is.
+            job.quality = o.normal_format == "jpg" ? o.jpeg_quality : -1;
+            job.image.width = warp.outWidth();
+            job.image.height = warp.outHeight();
+            job.image.channels = 3;
+            job.image.data.resize(normal.size());
+            // BLACK is the trainer's "no normal here": it decodes
+            // byte/127.5 - 1 and masks on a sum <= -2.366 or a length
+            // under 0.25 (core/Interpolation.cuh's gt_normal_valid).
+            for (size_t p = 0; p * 3 < normal.size(); ++p) {
+                const float* v = &normal[p * 3];
+                uint8_t* out = &job.image.data[p * 3];
+                if (v[0]*v[0] + v[1]*v[1] + v[2]*v[2] < 0.25f) {
+                    out[0] = out[1] = out[2] = 0;
+                    continue;
+                }
+                for (int c = 0; c < 3; ++c)
+                    out[c] = (uint8_t)std::lround(
+                        std::fmin(255.0f, std::fmax(0.0f, 127.5f + 127.5f * v[c])));
+            }
+            writers.submit(std::move(job));
+        }
+        if (need_depth) {
+            // 0 is the trainer's "no ground truth here", so a covered pixel
+            // never rounds into it.
+            const float inv = o.depth_mm ? 1.0f : 1.0f / depth_scale(depth);
+            app::WriteJob job;
+            job.path = dp.string();
+            job.geometry_key = keys[j] + "|depth";
+            job.geometry_overwrite = o.overwrite;
+            job.depth_w = warp.outWidth();
+            job.depth_h = warp.outHeight();
+            job.depth.resize(depth.size());
+            for (size_t px = 0; px < depth.size(); ++px) {
+                if (depth[px] <= 0.0f) { job.depth[px] = 0; continue; }
+                const float v = depth[px] * inv * (o.depth_mm ? 1.0f : 65535.0f);
+                job.depth[px] = (uint16_t)std::lround(
+                    std::fmin(65535.0f, std::fmax(1.0f, v)));
+            }
+            writers.submit(std::move(job));
+        }
+
+        progress.frame_done(todo.size() - j - 1);
+    }
+}
+
 }  // namespace
 
 int spirula_geometry_main(int argc, char** argv) {
@@ -839,7 +994,16 @@ int spirula_geometry_main(int argc, char** argv) {
             else { usage(); return 2; }
         }
         else if (a == "--overwrite") o.overwrite = true;
-        else if (a == "--every") o.every = std::max(1, std::atoi(next()));
+        else if (a == "--every") {
+            const char* v = next();
+            char* end = nullptr;
+            const long n = std::strtol(v, &end, 10);
+            if (end == v || *end || n < 1 || n > std::numeric_limits<int>::max()) {
+                usage();
+                return 2;
+            }
+            o.every = (int)n;
+        }
         else if (a == "--worker") o.worker = true;
         else if (a == "--worker-threads") o.worker_threads = std::max(1, std::atoi(next()));
         else if (a == "--worker-devices") o.worker_devices = next();
@@ -1067,20 +1231,10 @@ int spirula_geometry_main(int argc, char** argv) {
         };
 
         const double t_start = nn::now_ms();
-        int64_t written = 0, skipped = 0, modeled = 0;
-        double model_ms = 0;
+        int64_t written = 0, skipped = 0;
 
         // Settled before any frame is read, so the next one can be decoded
         // while the network runs on this one.
-        struct Todo {
-            int64_t i = 0;
-            fs::path np, dp;
-            bool normal = false, depth = false;
-            // `key` is the source's hash, then `key_rest`. Empty until hashed: a
-            // map that is not on disk is redone whatever the key, so its frame
-            // is hashed when it is read rather than before the first one runs.
-            std::string key, key_rest;
-        };
         const std::vector<bool> chosen = every_nth(ds, o.every);
         const int64_t N_run = (int64_t)std::count(chosen.begin(), chosen.end(), true);
         const bool lazy_keys = !o.worker && worker_devices.empty();
@@ -1143,8 +1297,7 @@ int spirula_geometry_main(int argc, char** argv) {
         std::vector<Todo> todo;
         std::vector<Todo> retained;
         for (Todo& t : planned) {
-            const std::string normal_key = t.key + "|normal|" + o.normal_format + "|" +
-                                           std::to_string(o.jpeg_quality);
+            const std::string normal_key = normal_key_of(t.key, o);
             t.normal = o.want_normal && (o.overwrite || t.key.empty() ||
                 !app::geometry_output_complete(t.np, normal_key));
             t.depth = o.want_depth && (o.overwrite || t.key.empty() ||
@@ -1164,13 +1317,9 @@ int spirula_geometry_main(int argc, char** argv) {
             todo.push_back(std::move(t));
         }
 
-        auto normal_key = [&](const Todo& t) {
-            return t.key + "|normal|" + o.normal_format + "|" + std::to_string(o.jpeg_quality);
-        };
         auto complete = [&](const Todo& t, const std::string& key) {
-            const std::string nk = key + "|normal|" + o.normal_format + "|" +
-                                   std::to_string(o.jpeg_quality);
-            return (!o.want_normal || app::geometry_output_complete(t.np, nk)) &&
+            return (!o.want_normal ||
+                    app::geometry_output_complete(t.np, normal_key_of(key, o))) &&
                    (!o.want_depth || app::geometry_output_complete(t.dp, key + "|depth"));
         };
         std::shared_ptr<const app::GeometryWarp> current_warp;
@@ -1233,9 +1382,10 @@ int spirula_geometry_main(int argc, char** argv) {
                 ahead[next_read] = read_at(next_read, same ? current_warp : nullptr);
             }
         };
-        // The previous batch's host half -- MoGe's remap and shift, the blend,
-        // the encoding -- runs here while the device runs the next batch.
-        // Declared after `writers`, so an unwinding throw waits for it first.
+        // The previous batch's host half (finish_batch), beside the device's
+        // next batch. Declared after `writers` and `progress`, so an unwinding
+        // throw waits for it first.
+        Progress progress{written, skipped, N_run, t_start, o.worker};
         std::future<void> finishing;
 
         for (size_t j0 = 0; j0 < todo.size();) {
@@ -1258,12 +1408,7 @@ int spirula_geometry_main(int argc, char** argv) {
                 ++j1;
             read_until(j1 + (o.worker ? 1 : per));
 
-            struct Frame {
-                size_t j = 0;
-                sfm::ExifTransform back;
-                size_t first = 0;   // its first face in `reqs`
-            };
-            std::vector<Frame> frames;
+            std::vector<BatchFrame> frames;
             std::vector<std::vector<float>> face_rgb;
             std::vector<app::GeometryRequest> reqs;
             for (size_t j = j0; j < j1; ++j) {
@@ -1289,139 +1434,22 @@ int spirula_geometry_main(int argc, char** argv) {
                     reqs.push_back(app::turn_request(rq, turn));
                 }
             }
-            const double t0 = nn::now_ms();
             std::vector<const float*> faces;
             for (const std::vector<float>& f : face_rgb) faces.push_back(f.data());
             app::GeometryModel::Finish finish =
                 faces.empty() ? app::GeometryModel::Finish()
                               : pred.predictBatchDeferred(faces, reqs);
-            model_ms += nn::now_ms() - t0;
-            modeled += (int64_t)frames.size();
             std::vector<std::vector<float>>().swap(face_rgb);
 
             if (finishing.valid()) finishing.get();
-            finishing = std::async(std::launch::async,
-                [&, warp_ref, frames = std::move(frames), reqs = std::move(reqs),
-                 finish = std::move(finish), each = model_ms / (double)std::max<int64_t>(modeled, 1)] {
-            const app::GeometryWarp& warp = *warp_ref;
-            std::vector<app::GeometryPrediction> preds =
-                finish ? finish() : std::vector<app::GeometryPrediction>();
-            NN_CHECK(preds.size() == reqs.size(), "the network returned %zu of %zu faces",
-                     preds.size(), reqs.size());
-
-            for (const Frame& f : frames) {
-                const size_t j = f.j;
-                const fs::path& np = todo[j].np;
-                const fs::path& dp = todo[j].dp;
-                const bool need_normal = todo[j].normal;
-                const bool need_depth = todo[j].depth;
-                const sfm::ExifTransform& back = f.back;
-                std::vector<std::vector<float>> face_depth, face_normal, face_mask;
-                for (int k = 0; k < warp.faces(); ++k) {
-                    app::GeometryPrediction& p = preds[f.first + (size_t)k];
-                    const app::GeometryRequest& rq = reqs[f.first + (size_t)k];
-                    NN_CHECK(p.width == rq.width && p.height == rq.height,
-                             "the network returned %dx%d for a %dx%d face", p.width,
-                             p.height, rq.width, rq.height);
-                    const size_t pixels = (size_t)p.width * p.height;
-                    NN_CHECK((!need_depth || p.depth.size() == pixels) &&
-                             (!need_normal || p.normal.size() == pixels * 3) &&
-                             (p.mask.empty() || p.mask.size() == pixels),
-                             "the network returned incomplete geometry for face %d", k);
-                    int dw = p.width, dh = p.height;
-                    app::turn_pixels(back, 1, p.depth, dw, dh);
-                    dw = p.width;
-                    dh = p.height;
-                    app::turn_pixels(back, 1, p.mask, dw, dh);
-                    dw = p.width;
-                    dh = p.height;
-                    app::turn_normals(back, p.normal, dw, dh);
-                    p.width = warp.faceWidth(k);
-                    p.height = warp.faceHeight(k);
-                    // Millimetres on every face before they are blended: Metric3D's
-                    // depth is canonical to the face's own focal.
-                    const float mm = (float)pred.depthToMillimetres(warp.faceFocal(k));
-                    for (float& d : p.depth) d *= mm;
-                    face_depth.push_back(std::move(p.depth));
-                    face_normal.push_back(std::move(p.normal));
-                    face_mask.push_back(std::move(p.mask));
-                }
-
-                const bool ray = o.ray_depth == Tri::Auto ? warp.defaultRayDepth()
-                                                          : o.ray_depth == Tri::Yes;
-                std::vector<float> depth, normal;
-                warp.gather(face_depth, face_normal, face_mask, ray,
-                            need_depth ? &depth : nullptr, need_normal ? &normal : nullptr);
-                NN_CHECK((!need_depth || depth.size() == (size_t)warp.outWidth() * warp.outHeight()) &&
-                         (!need_normal || normal.size() == (size_t)warp.outWidth() * warp.outHeight() * 3),
-                         "the gathered geometry is incomplete");
-
-                if (need_normal) {
-                    app::WriteJob job;
-                    job.path = np.string();
-                    job.geometry_key = todo_keys[j] + "|normal|" + o.normal_format + "|" +
-                                       std::to_string(o.jpeg_quality);
-                    job.geometry_overwrite = o.overwrite;
-                    // A quality INSIDE 0..100 is what selects JPEG; the extension
-                    // is not consulted (nn/io/Image.h). 100 wrote a JPEG called
-                    // .png, which is lossy right where the mask edge is.
-                    job.quality = o.normal_format == "jpg" ? o.jpeg_quality : -1;
-                    job.image.width = warp.outWidth();
-                    job.image.height = warp.outHeight();
-                    job.image.channels = 3;
-                    job.image.data.resize(normal.size());
-                    // BLACK is the trainer's "no normal here": it decodes
-                    // byte/127.5 - 1 and masks on a sum <= -2.366 or a length
-                    // under 0.25 (core/Interpolation.cuh's gt_normal_valid).
-                    for (size_t p = 0; p * 3 < normal.size(); ++p) {
-                        const float* v = &normal[p * 3];
-                        uint8_t* out = &job.image.data[p * 3];
-                        if (v[0]*v[0] + v[1]*v[1] + v[2]*v[2] < 0.25f) {
-                            out[0] = out[1] = out[2] = 0;
-                            continue;
-                        }
-                        for (int c = 0; c < 3; ++c)
-                            out[c] = (uint8_t)std::lround(
-                                std::fmin(255.0f, std::fmax(0.0f, 127.5f + 127.5f * v[c])));
-                    }
-                    writers.submit(std::move(job));
-                }
-                if (need_depth) {
-                    // 0 is the trainer's "no ground truth here", so a covered pixel
-                    // never rounds into it.
-                    const float inv = o.depth_mm ? 1.0f : 1.0f / depth_scale(depth);
-                    app::WriteJob job;
-                    job.path = dp.string();
-                    job.geometry_key = todo_keys[j] + "|depth";
-                    job.geometry_overwrite = o.overwrite;
-                    job.depth_w = warp.outWidth();
-                    job.depth_h = warp.outHeight();
-                    job.depth.resize(depth.size());
-                    for (size_t px = 0; px < depth.size(); ++px) {
-                        if (depth[px] <= 0.0f) { job.depth[px] = 0; continue; }
-                        const float v = depth[px] * inv * (o.depth_mm ? 1.0f : 65535.0f);
-                        job.depth[px] = (uint16_t)std::lround(
-                            std::fmin(65535.0f, std::fmax(1.0f, v)));
-                    }
-                    writers.submit(std::move(job));
-                }
-
-                ++written;
-                if (!o.worker) {
-                    std::printf("%s\n",
-                                format(G::log_progress,
-                                       {(long long)(written + skipped), (long long)N_run,
-                                        (long long)std::lround(each),
-                                        format_duration(each * (double)(todo.size() - j - 1) /
-                                                        1000.0)})
-                                    .c_str());
-                    std::fflush(stdout);
-                }
-            }
-            });
+            finishing = std::async(std::launch::async, finish_batch, std::cref(o),
+                                   std::cref(pred), warp_ref, std::cref(todo),
+                                   std::cref(todo_keys), std::move(frames), std::move(reqs),
+                                   std::move(finish), std::ref(writers), std::ref(progress));
             j0 = j1;
         }
         if (finishing.valid()) finishing.get();
+        written = progress.written;
         writers.finish();
         NN_CHECK(writers.failures() == 0, "geometry writers failed");
         for (size_t j = 0; j < todo.size(); ++j)
@@ -1527,7 +1555,7 @@ int spirula_geometry_main(int argc, char** argv) {
                 std::vector<app::GeometryStagedOutput> outputs;
                 if (t.normal) outputs.push_back({
                     folder / (o.normal_format == "jpg" ? "normal.jpg" : "normal.png"),
-                    t.np, normal_key(t)});
+                    t.np, normal_key_of(t.key, o)});
                 if (t.depth) outputs.push_back({folder / "depth.png", t.dp, t.key + "|depth"});
                 families.push_back(std::move(outputs));
             }

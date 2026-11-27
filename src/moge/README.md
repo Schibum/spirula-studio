@@ -199,6 +199,15 @@ second focal, which keeps this a one-parameter fit and is exact wherever
 `depth = (z + shift) * metric_scale`, in metres, and 0 wherever the mask scored
 below 0.5 or the shifted z came out negative.
 
+### Two halves: `run()` and `finish()`
+
+`predict()` is `finish(run())`. `run()` holds the device: upload, the network,
+and the download of the three raw maps. `finish()` is everything above -- the
+exp remap, the normalization, the sigmoid and the shift solve -- as host
+arithmetic with no device state, safe on any thread. `spirula geometry` runs a
+frame's `finish()`, blend and encoding on a thread while `run()` feeds the
+device the next frame; the maps are the same bytes as `predict()`'s.
+
 ## MoGe-3: the sparse 3D refiner
 
 `moge3-vitl` is MoGe-2's network -- MoGe's `v3.py` subclasses `v2.py`, and the
@@ -337,11 +346,8 @@ bug cannot hide under the rounding; neither is a quality knob.
 ## Not done yet
 
 - **Batching the faces.** A split frame runs its faces through the network
-  one at a time, as `src/metric3d/` does. What `spirula geometry` does instead
-  is overlap: `Predictor::run()` is the device half and `finish()` the host
-  half, and a frame's host half -- with the blend and the encoding -- runs
-  while the device works on the next frame. The maps are the same bytes as
-  `predict()`'s; a batch would also hide the wait on each face's download.
+  one at a time, as `src/metric3d/` does, and the feeding thread waits on each
+  face's download.
 - **The panorama path.** MoGe ships an `infer_panorama.py` that splits an
   equirectangular frame into 12 overlapping views and merges in the spherical
   domain. `app/GeometryWarp.h`'s 6-face cube map with a log-median alignment is
