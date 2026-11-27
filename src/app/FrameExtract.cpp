@@ -241,19 +241,31 @@ namespace {
 // What a chosen instant becomes
 // ---------------------------------------------------------------------------
 
+// Submits `job` unless keep_existing finds its file already written.
+void submit_frame(const FrameExtractJob& o, WriterPool& pool, StemWatermark* mark,
+                  int64_t seq, WriteJob&& job) {
+    std::error_code ec;
+    if (o.keep_existing && fs::exists(job.path, ec)) return;
+    if (mark) {
+        job.atomic = true;
+        job.done = mark->add(seq);
+    }
+    pool.submit(std::move(job));
+}
+
 // One track into one folder, masked on the way when there is a masker.
 bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                    const Decode& decode, int track, const fs::path& image_dir,
                    const fs::path& mask_dir, sam::Masker* masker,
                    const FrameExposure& exposure, WriterPool& pool,
-                   FrameExtractStats& t) {
+                   StemWatermark* mark, FrameExtractStats& t) {
     fs::create_directories(image_dir);
     if (masker) fs::create_directories(mask_dir);
     const bool jpeg = o.quality >= 0 && o.quality <= 100;
     auto on_frame = [&](std::vector<nn::Image>& imgs, int64_t index, std::string&) {
         nn::Image& image = imgs[0];
-        char stem[64];
-        std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        const std::string stem = frame_stem(index);
+        const int64_t seq = mark ? mark->open(stem) : 0;
         if (masker) {
             const double t0 = nn::now_ms();
             sam::Mask mask;
@@ -265,27 +277,28 @@ bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                 t.mask += nn::now_ms() - t0;
                 WriteJob mj;
                 mj.mask = std::move(mask);
-                mj.path = (mask_dir / (std::string(stem) + ".png")).string();
-                pool.submit(std::move(mj));
+                mj.path = (mask_dir / (stem + ".png")).string();
+                submit_frame(o, pool, mark, seq, std::move(mj));
                 if (o.write_overlay)
                     sam::save_overlay_png(
                         image, overlay,
-                        (mask_dir / (std::string(stem) + "_overlay.png")).string());
+                        (mask_dir / (stem + "_overlay.png")).string());
             } else {
                 log_line(sinks, "frame " + std::to_string(index) +
                                     ": masking failed: " + masker->lastError());
             }
         }
         WriteJob job;
-        job.path = (image_dir / (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+        job.path = (image_dir / (stem + (jpeg ? ".jpg" : ".png"))).string();
         if (sinks.preview && image.channels == 3)
             sinks.preview(image.data.data(), image.width, image.height, job.path);
         job.quality = o.quality;
         job.exif = exposure.exif(index);
         job.image = std::move(image);
         const double t0 = nn::now_ms();
-        pool.submit(std::move(job));
+        submit_frame(o, pool, mark, seq, std::move(job));
         t.submit += nn::now_ms() - t0;
+        if (mark) mark->seal(seq);
         ++t.written;
         return true;
     };
@@ -296,7 +309,7 @@ bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
 bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                   const Decode& decode, const Decoder& d, const fs::path& image_dir,
                   const FrameExposure& exposure, WriterPool& pool,
-                  FrameExtractStats& t, std::string& error) {
+                  StemWatermark* mark, FrameExtractStats& t, std::string& error) {
     const std::vector<int> want = pano360_needs_track1(o.eac)
                                       ? std::vector<int>{0, 1}
                                       : std::vector<int>{0};
@@ -327,8 +340,8 @@ bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                        track.size() > 1 ? track[1].data.data() : nullptr,
                        canvas.data());
         t.convert += nn::now_ms() - t0;
-        char stem[64];
-        std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        const std::string stem = frame_stem(index);
+        const int64_t seq = mark ? mark->open(stem) : 0;
         const std::vector<uint8_t> exif = exposure.exif(index);
         for (size_t i = 0; i < o.views.size(); i++) {
             t0 = nn::now_ms();
@@ -341,19 +354,20 @@ bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                           job.image.data.data());
             t.convert += nn::now_ms() - t0;
             job.path = (image_dir / o.views[i].dir /
-                        (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+                        (stem + (jpeg ? ".jpg" : ".png"))).string();
             job.quality = o.quality;
             job.exif = exif;
             if (sinks.preview)
                 sinks.preview(job.image.data.data(), job.image.width, job.image.height,
                               job.path);
             t0 = nn::now_ms();
-            pool.submit(std::move(job));
+            submit_frame(o, pool, mark, seq, std::move(job));
             t.submit += nn::now_ms() - t0;
             // Per view, not per frame: the count is what the progress bar is
             // scaled against, and a plan writes six files here.
             ++t.written;
         }
+        if (mark) mark->seal(seq);
         return true;
     };
     return decode(want, false, on_frame);
@@ -364,7 +378,7 @@ bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
 bool extract_synced(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                     const Decode& decode, const std::vector<int>& tracks,
                     const fs::path& base, const FrameExposure& exposure,
-                    WriterPool& pool, FrameExtractStats& t) {
+                    WriterPool& pool, StemWatermark* mark, FrameExtractStats& t) {
     std::vector<fs::path> dirs;
     for (size_t k = 0; k < tracks.size(); k++) {
         dirs.push_back(base / ("cam" + std::to_string(k)));
@@ -373,22 +387,23 @@ bool extract_synced(const FrameExtractJob& o, const FrameExtractSinks& sinks,
     }
     const bool jpeg = o.quality >= 0 && o.quality <= 100;
     auto on_frame = [&](std::vector<nn::Image>& imgs, int64_t index, std::string&) {
-        char stem[64];
-        std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        const std::string stem = frame_stem(index);
+        const int64_t seq = mark ? mark->open(stem) : 0;
         const std::vector<uint8_t> exif = exposure.exif(index);
         for (size_t k = 0; k < imgs.size(); k++) {
             WriteJob job;
-            job.path = (dirs[k] / (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+            job.path = (dirs[k] / (stem + (jpeg ? ".jpg" : ".png"))).string();
             if (sinks.preview && imgs[k].channels == 3)
                 sinks.preview(imgs[k].data.data(), imgs[k].width, imgs[k].height, job.path);
             job.quality = o.quality;
             job.exif = exif;
             job.image = std::move(imgs[k]);
             const double t0 = nn::now_ms();
-            pool.submit(std::move(job));
+            submit_frame(o, pool, mark, seq, std::move(job));
             t.submit += nn::now_ms() - t0;
             ++t.written;
         }
+        if (mark) mark->seal(seq);
         return true;
     };
     return decode(tracks, true, on_frame);
@@ -499,6 +514,8 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
     stats.encoder_threads =
         job.threads > 0 ? job.threads
                         : std::max(1, (int)spirula::hardware_threads() - 1);
+    // Outlives the pool, whose workers report into it.
+    std::unique_ptr<StemWatermark> mark;
     WriterPool pool(stats.encoder_threads);
 
     const fs::path base(job.image_dir);
@@ -514,12 +531,10 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
         const bool jpeg = job.quality >= 0 && job.quality <= 100;
         sinks.judged = [&, jpeg](const FramePick& p, const nn::Image& im) {
             if (p.verdict != PickVerdict::Kept) {
-                char stem[64];
-                std::snprintf(stem, sizeof(stem), "%05lld", (long long)p.index);
                 WriteJob w;
                 w.image = im;
                 w.path = (fs::path(job.skipped_dir) /
-                          (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+                          (frame_stem(p.index) + (jpeg ? ".jpg" : ".png"))).string();
                 w.quality = job.quality;
                 w.exif = exposure.exif(p.index);
                 pool.submit(std::move(w));
@@ -545,6 +560,35 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
             return false;
         }
         report_plan(sinks, plan, mi.frames, mi.fps);
+    }
+
+    if (sinks.layout || sinks.landed) {
+        if (!pano && !synced && tracks.size() > 1) {
+            error = "a plan or progress file needs one track, --sync or a 360 capture";
+            return false;
+        }
+        FramePlan layout;
+        if (pano)
+            for (const Pano360View& v : job.views) layout.tracks.push_back((base / v.dir).string());
+        else if (synced)
+            for (size_t k = 0; k < tracks.size(); k++)
+                layout.tracks.push_back((base / ("cam" + std::to_string(k))).string());
+        else
+            layout.tracks.push_back(base.string());
+        layout.ends = plan;
+        layout.keep = job.keep;
+        layout.skip = job.skip;
+        const bool exact = !plan.empty() && job.keep <= 1 && job.blur_reject <= 0 &&
+                           job.similar_bits <= 0 && job.max_frames <= 0 &&
+                           job.clip_start <= 0 && job.clip_end <= 0;
+        if (exact)
+            for (int64_t e : plan) layout.stems.push_back(frame_stem(e));
+        if (sinks.layout) sinks.layout(layout);
+        if (sinks.landed) {
+            mark = std::make_unique<StemWatermark>(sinks.landed);
+            for (const std::string& dir : layout.tracks) remove_atomic_temps(dir);
+            if (masker) remove_atomic_temps(mask_base.string());
+        }
     }
 
 #ifdef SS_HAVE_VIDEO
@@ -574,9 +618,11 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
     };
     if (pano) {
         stats.tracks = 2;
-        ok = extract_pair(job, sinks, decode, dec, base, exposure, pool, stats, error);
+        ok = extract_pair(job, sinks, decode, dec, base, exposure, pool, mark.get(), stats,
+                          error);
     } else if (synced) {
-        ok = extract_synced(job, sinks, decode, tracks, base, exposure, pool, stats);
+        ok = extract_synced(job, sinks, decode, tracks, base, exposure, pool, mark.get(),
+                            stats);
     }
     for (size_t ti = 0; ti < tracks.size() && ok && !pano && !synced; ++ti) {
         // A multi-track file (an Insta360 .insv carries two fisheye streams)
@@ -589,9 +635,10 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
             log_line(sinks, "track " + std::to_string(tracks[ti]) + " -> " +
                                 image_dir.string());
         ok = extract_track(job, sinks, decode, tracks[ti], image_dir, mask_dir,
-                           masker.get(), exposure, pool, stats);
+                           masker.get(), exposure, pool, mark.get(), stats);
     }
 
+    stats.builtin_decoder = dec.builtin;
     const double t_drain = nn::now_ms();
     pool.finish();
     stats.drain = nn::now_ms() - t_drain;

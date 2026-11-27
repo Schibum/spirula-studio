@@ -14,6 +14,7 @@
 #include "app/FrameClip.h"
 #include "app/FrameLook.h"
 #include "app/FramePick.h"
+#include "app/FrameStream.h"
 #include "app/FrameMotion.h"
 #include "nn/io/Image.h"
 #include "sam/Masking.h"
@@ -78,6 +79,9 @@ struct FrameExtractJob : FrameLook {
     // videos on one rate share a budget, and that plan cannot be made from one
     // of them. Empty lets the run measure and plan its own.
     std::vector<int64_t> plan;
+    // A frame file already there is left as it is, for a resumed run on the
+    // same plan; it still counts as landed.
+    bool keep_existing = false;
 
     // Masking. Empty model = no masks.
     sam::MaskOptions mask;
@@ -97,6 +101,7 @@ struct FrameExtractStats {
     int    tracks = 1;
     int    encoder_threads = 0;
     int    write_failures = 0;
+    bool   builtin_decoder = false;   // Vulkan Video ran, not ffmpeg
 };
 
 struct FrameExtractSinks {
@@ -122,6 +127,12 @@ struct FrameExtractSinks {
     // the pixels: the decoder does not wait.
     std::function<void(const uint8_t* rgb, int w, int h,
                        const std::string& path)> preview;
+    // Before the first frame is written: where each instant goes, and the plan.
+    std::function<void(const FramePlan&)> layout;
+    // Stems newly on disk in every folder, in time order, from a writer thread
+    // (StemWatermark). Set, frames are written under a temporary name and
+    // renamed. Either sink refuses unsynced multi-track runs.
+    std::function<void(const std::vector<std::string>&)> landed;
     // Polled between frames; set it to stop early. Frames already written stay.
     const std::atomic<bool>* cancel = nullptr;
 };

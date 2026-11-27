@@ -10,6 +10,7 @@
 
 #include "app/FfmpegVideo.h"
 #include "app/FrameExtract.h"
+#include "app/FrameStream.h"
 #include "app/LogLuts.h"
 #include "app/Tools.h"
 #include "app/cli/ModelLicense.h"
@@ -23,12 +24,18 @@
 #include "sfm/core/Telemetry.h"
 #endif
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -94,6 +101,9 @@ void usage() {
     help_row("    --similar <n>", H::xh_similar);
     help_row("    --skipped-dir <dir>", H::xh_skipped_dir);
     help_row("    --report <file>", H::xh_report);
+    help_row("    --plan-out <file>", H::xh_plan_out);
+    help_row("    --plan-in <file>", H::xh_plan_in);
+    help_row("    --progress <file>", H::xh_progress);
     help_row("    --threads <n>", H::xh_threads);
     help_row("    --decoder <d>", H::xh_decoder);
     help_row("    --ffmpeg <exe>", H::xh_ffmpeg);
@@ -162,6 +172,7 @@ struct Options {
     int    similar = 0;
     std::string skipped_dir;
     std::string report;
+    std::string plan_out, plan_in, progress;
     int    threads = 0;
     app::FrameDecoder decoder = app::FrameDecoder::Auto;
     std::string ffmpeg = "ffmpeg";
@@ -228,6 +239,9 @@ bool parse_args(int argc, char** argv, Options& o) {
             o.skipped_dir = next("--skipped-dir");
         else if (a == "--report")
             o.report = next("--report");
+        else if (a == "--plan-out") o.plan_out = next("--plan-out");
+        else if (a == "--plan-in") o.plan_in = next("--plan-in");
+        else if (a == "--progress") o.progress = next("--progress");
         else if (a == "--threads") o.threads = std::atoi(next("--threads"));
         else if (a == "--decoder") {
             const std::string d = next("--decoder");
@@ -304,6 +318,64 @@ bool parse_args(int argc, char** argv, Options& o) {
     return true;
 }
 
+// The --progress file: JSON lines, at most one each kInterval, the last one
+// always (app/FrameStream.h, frame_progress_line).
+class ProgressFile {
+public:
+    bool open(const std::string& path) {
+        f_ = std::fopen(path.c_str(), "w");
+        if (!f_) return false;
+        flusher_ = std::thread([this] {
+            std::unique_lock<std::mutex> lk(mu_);
+            while (!stop_) {
+                cv_.wait_for(lk, kInterval);
+                if (!pending_.empty() && Clock::now() - last_ >= kInterval) write(false);
+            }
+        });
+        return true;
+    }
+    void landed(const std::vector<std::string>& stems) {
+        std::lock_guard<std::mutex> lk(mu_);
+        pending_.insert(pending_.end(), stems.begin(), stems.end());
+        written_ += (int64_t)stems.size();
+        if (Clock::now() - last_ >= kInterval) write(false);
+    }
+    // `done` only for a run that wrote everything it chose.
+    void close(bool done) {
+        if (!f_) return;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        flusher_.join();
+        if (done || !pending_.empty()) write(done);
+        std::fclose(f_);
+        f_ = nullptr;
+    }
+    ~ProgressFile() { close(false); }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::chrono::milliseconds kInterval{250};
+    void write(bool done) {
+        const std::string line = app::frame_progress_line(written_, pending_, done);
+        std::fwrite(line.data(), 1, line.size(), f_);
+        std::fflush(f_);
+        pending_.clear();
+        last_ = Clock::now();
+    }
+
+    std::FILE* f_ = nullptr;
+    std::thread flusher_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<std::string> pending_;
+    int64_t written_ = 0;
+    Clock::time_point last_{};
+    bool stop_ = false;
+};
+
 }  // namespace
 
 // Declared in sam_main.cpp's dispatcher.
@@ -355,6 +427,25 @@ int sam_cli_extract(int argc, char** argv) {
     job.similar_bits = o.similar;
     job.skipped_dir = o.skipped_dir;
     job.threads = o.threads;
+    if (!o.plan_in.empty()) {
+        app::FramePlan plan;
+        std::string err;
+        if (app::read_frame_plan(o.plan_in, plan, err)) {
+            if (plan.keep != o.keep)
+                err = o.plan_in + ": made with --keep " + std::to_string(plan.keep) +
+                      ", not " + std::to_string(o.keep);
+            else if (plan.ends.empty() && o.adaptive)
+                err = o.plan_in + ": holds no adaptive plan";
+        }
+        if (!err.empty()) {
+            std::fprintf(stderr, "%s\n",
+                         spirula::i18n::format(spirula::i18n::msg::cli::error_line,
+                                               {err}).c_str());
+            return 2;
+        }
+        job.plan = plan.ends;
+        job.keep_existing = true;
+    }
     job.decoder = o.decoder;
     job.ffmpeg_exe = o.ffmpeg;
     job.write_overlay = o.overlay;
@@ -434,6 +525,36 @@ int sam_cli_extract(int argc, char** argv) {
         };
     }
 
+    for (const std::string& f : {o.plan_out, o.progress}) {
+        std::error_code ec;
+        const fs::path dir = fs::path(f).parent_path();
+        if (!f.empty() && !dir.empty()) fs::create_directories(dir, ec);
+    }
+    // A reader waiting on a plan that never comes would wait forever.
+    std::string plan_error;
+    std::atomic<bool> stop{false};
+    if (!o.plan_out.empty()) {
+        sinks.cancel = &stop;
+        sinks.layout = [&](const app::FramePlan& p) {
+            if (app::write_text_atomic(o.plan_out, app::frame_plan_json(p), plan_error))
+                return;
+            std::fprintf(stderr, "%s\n",
+                         spirula::i18n::format(spirula::i18n::msg::cli::error_line,
+                                               {plan_error}).c_str());
+            stop = true;
+        };
+    }
+    ProgressFile progress;
+    if (!o.progress.empty()) {
+        if (!progress.open(o.progress)) {
+            std::fprintf(stderr, "%s\n",
+                         spirula::i18n::format(spirula::i18n::msg::cli::error_line,
+                                               {"could not write " + o.progress}).c_str());
+            return 1;
+        }
+        sinks.landed = [&](const std::vector<std::string>& stems) { progress.landed(stems); };
+    }
+
     app::FrameExtractStats stats;
     std::string error;
     int rc = 0;
@@ -446,6 +567,8 @@ int sam_cli_extract(int argc, char** argv) {
     if (report) std::fclose(report);
     std::printf("%s", app::format_extract_stats(stats, base.string(),
                                                 !o.model.empty()).c_str());
+    // Machine-readable and English in every language, for a script.
+    std::printf("decoder: %s\n", stats.builtin_decoder ? "vulkan" : "ffmpeg");
     if (stats.write_failures) {
         std::fprintf(stderr, "%s %s\n",
                      spirula::i18n::msg::data::word_warning.get(),
@@ -454,5 +577,7 @@ int sam_cli_extract(int argc, char** argv) {
                          {stats.write_failures}).c_str());
         rc = 1;
     }
+    if (!plan_error.empty()) rc = 1;
+    progress.close(rc == 0);
     return rc;
 }

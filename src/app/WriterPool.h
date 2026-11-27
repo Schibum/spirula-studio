@@ -27,6 +27,8 @@
 #include <deque>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -45,7 +47,27 @@ struct WriteJob {
     std::vector<uint8_t>  exif;     // APP1 payload for a JPEG image; empty writes none
     std::string           geometry_key; // opt-in checked, atomic geometry publication
     bool                  geometry_overwrite = false;
+    // Encoded to atomic_temp_path(path) and renamed, so a reader never sees half a file.
+    bool                  atomic = false;
+    // Called on the worker once the file is on disk (true) or has failed.
+    std::function<void(bool)> done;
 };
+
+// ".<name>.tmp" beside `path`: hidden, and no glob for the real extension matches it.
+inline std::string atomic_temp_path(const std::string& path) {
+    const std::filesystem::path p(path);
+    return (p.parent_path() / ("." + p.filename().string() + ".tmp")).string();
+}
+
+// Removes what an interrupted run left under atomic_temp_path names in `dir`.
+inline void remove_atomic_temps(const std::string& dir) {
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string n = e.path().filename().string();
+        if (n.size() > 5 && n[0] == '.' && n.compare(n.size() - 4, 4, ".tmp") == 0)
+            std::filesystem::remove(e.path(), ec);
+    }
+}
 
 class WriterPool {
 public:
@@ -156,9 +178,20 @@ private:
                     const bool closed = std::fclose(file) == 0;
                     return good && closed;
                 };
-                ok = job.geometry_key.empty()
-                    ? encode(job.path)
-                    : publish_geometry_output(job.path, job.geometry_key, encode, job.geometry_overwrite);
+                if (!job.geometry_key.empty()) {
+                    ok = publish_geometry_output(job.path, job.geometry_key, encode,
+                                                 job.geometry_overwrite);
+                } else if (job.atomic) {
+                    const std::string part = atomic_temp_path(job.path);
+                    std::error_code ec;
+                    ok = encode(part);
+                    if (ok) std::filesystem::rename(part, job.path, ec);
+                    if (ec) why = ec.message();
+                    ok = ok && !ec;
+                    if (!ok) std::filesystem::remove(part, ec);
+                } else {
+                    ok = encode(job.path);
+                }
             } catch (const std::exception& e) {
                 why = e.what();
             } catch (...) {
@@ -169,6 +202,7 @@ private:
                 NN_LOG_ERROR("could not write %s%s%s\n", job.path.c_str(),
                              why.empty() ? "" : ": ", why.c_str());
             }
+            if (job.done) job.done(ok);
             double expected = busy_ms_.load();
             const double add = nn::now_ms() - t0;
             while (!busy_ms_.compare_exchange_weak(expected, expected + add)) {}
