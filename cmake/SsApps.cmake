@@ -466,6 +466,11 @@ add_executable(frame_pick_test
     ${SS_SRC}/app/FrameSharpness.cpp)
 ss_configure_app(frame_pick_test)
 
+# The plan file and the watermark a streaming masker reads: no device.
+add_executable(frame_stream_test
+    ${SS_SRC}/app/tests/frame_stream_test.cpp)
+ss_configure_app(frame_stream_test)
+
 add_executable(model_download_test
     ${SS_SRC}/app/tests/model_download_test.cpp
     ${SS_SRC}/app/gui/ModelCache.cpp

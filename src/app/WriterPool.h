@@ -21,12 +21,24 @@
 #include "sam/Sam.h"
 #include "sfm/core/Exif.h"
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <signal.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -45,7 +57,57 @@ struct WriteJob {
     std::vector<uint8_t>  exif;     // APP1 payload for a JPEG image; empty writes none
     std::string           geometry_key; // opt-in checked, atomic geometry publication
     bool                  geometry_overwrite = false;
+    // Encoded to atomic_temp_path(path) and renamed, so a reader never sees half a file.
+    bool                  atomic = false;
+    // Called on the worker once the file is on disk (true) or has failed.
+    std::function<void(bool)> done;
 };
+
+inline long current_pid() {
+#ifdef _WIN32
+    return (long)_getpid();
+#else
+    return (long)getpid();
+#endif
+}
+
+// ".<name>.<pid>.tmp" beside `path`: hidden, and no glob for the real
+// extension matches it.
+inline std::string atomic_temp_path(const std::string& path) {
+    const std::filesystem::path p(path);
+    return (p.parent_path() / ("." + p.filename().string() + "." +
+                               std::to_string(current_pid()) + ".tmp")).string();
+}
+
+// Removes the atomic_temp_path files of a .jpg/.png/.jpeg that a process no
+// longer running left in `dir`. Windows has no cheap liveness test without
+// <windows.h>, so there a temp counts as dead after ten minutes.
+inline void remove_atomic_temps(const std::string& dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        const std::string n = e.path().filename().string();
+        if (n.size() < 8 || n[0] != '.' || n.compare(n.size() - 4, 4, ".tmp") != 0) continue;
+        const std::string body = n.substr(1, n.size() - 5);   // <name>.<pid>
+        const size_t dot = body.rfind('.');
+        if (dot == std::string::npos || dot + 1 == body.size() ||
+            body.find_first_not_of("0123456789", dot + 1) != std::string::npos)
+            continue;
+        const std::string name = body.substr(0, dot);
+        const size_t ext = name.rfind('.');
+        const std::string x = ext == std::string::npos ? "" : name.substr(ext);
+        if (x != ".jpg" && x != ".png" && x != ".jpeg") continue;
+        const long pid = std::atol(body.c_str() + dot + 1);
+        if (pid == current_pid()) continue;
+#ifdef _WIN32
+        const auto age = fs::file_time_type::clock::now() - fs::last_write_time(e.path(), ec);
+        if (ec || age < std::chrono::minutes(10)) continue;
+#else
+        if (::kill((pid_t)pid, 0) == 0 || errno == EPERM) continue;
+#endif
+        fs::remove(e.path(), ec);
+    }
+}
 
 class WriterPool {
 public:
@@ -156,9 +218,20 @@ private:
                     const bool closed = std::fclose(file) == 0;
                     return good && closed;
                 };
-                ok = job.geometry_key.empty()
-                    ? encode(job.path)
-                    : publish_geometry_output(job.path, job.geometry_key, encode, job.geometry_overwrite);
+                if (!job.geometry_key.empty()) {
+                    ok = publish_geometry_output(job.path, job.geometry_key, encode,
+                                                 job.geometry_overwrite);
+                } else if (job.atomic) {
+                    const std::string part = atomic_temp_path(job.path);
+                    std::error_code ec;
+                    ok = encode(part);
+                    if (ok) std::filesystem::rename(part, job.path, ec);
+                    if (ec) why = ec.message();
+                    ok = ok && !ec;
+                    if (!ok) std::filesystem::remove(part, ec);
+                } else {
+                    ok = encode(job.path);
+                }
             } catch (const std::exception& e) {
                 why = e.what();
             } catch (...) {
@@ -169,6 +242,7 @@ private:
                 NN_LOG_ERROR("could not write %s%s%s\n", job.path.c_str(),
                              why.empty() ? "" : ": ", why.c_str());
             }
+            if (job.done) job.done(ok);
             double expected = busy_ms_.load();
             const double add = nn::now_ms() - t0;
             while (!busy_ms_.compare_exchange_weak(expected, expected + add)) {}

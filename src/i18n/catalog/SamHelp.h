@@ -444,6 +444,66 @@ SS_MSG(trk_max_frames,
     RU("остановиться после n кадров"),
     TR("n kareden sonra dur"));
 
+SS_MSG(trk_follow,
+    EN("read frame paths from stdin, one per line, instead of --frames; name"
+       " each mask after its frame and print done <stem>, or failed <stem> and"
+       " exit with 1"),
+    JA("--frames の代わりに標準入力からフレームのパスを 1 行に 1 つ読みます。マスクはフレームの名前で書き、done <stem> を出力します。失敗は failed <stem> で、終了コードは 1"),
+    ZH_HANS("从标准输入每行读取一个帧路径以代替 --frames；遮罩以其帧命名并输出 done <stem>；失败时输出 failed <stem>，退出码为 1"),
+    ZH_HANT("從標準輸入每行讀取一個影格路徑以代替 --frames；遮罩以其影格命名並輸出 done <stem>；失敗時輸出 failed <stem>，結束碼為 1"),
+    KO("--frames 대신 표준 입력에서 한 줄에 하나씩 프레임 경로를 읽습니다. 마스크는 "
+       "프레임 이름으로 쓰고 done <stem> 을, 실패하면 failed <stem> 을 출력하고 1 로 "
+       "끝납니다"),
+    DE("liest Bildpfade von stdin, einen pro Zeile, statt --frames; benennt "
+       "jede Maske nach ihrem Bild und gibt done <stem> aus, oder failed "
+       "<stem> und endet mit 1"),
+    FR("lit les chemins des images sur stdin, un par ligne, au lieu de "
+       "--frames ; nomme chaque masque d'après son image et affiche done "
+       "<stem>, ou failed <stem> et sort avec 1"),
+    ES("lee las rutas de los fotogramas de stdin, una por línea, en vez de "
+       "--frames; nombra cada máscara como su fotograma e imprime done "
+       "<stem>, o failed <stem> y sale con 1"),
+    PT("lê os caminhos dos quadros do stdin, um por linha, em vez de "
+       "--frames; nomeia cada máscara como o seu quadro e imprime done "
+       "<stem>, ou failed <stem> e sai com 1"),
+    IT("legge da stdin un percorso per riga invece di --frames; chiama "
+       "ogni maschera come il suo fotogramma e stampa done <stem>, o failed "
+       "<stem> ed esce con 1"),
+    NL("leest beeldpaden van stdin, één per regel, in plaats van --frames; "
+       "noemt elk masker naar zijn beeld en drukt done <stem> af, of failed "
+       "<stem> en stopt met 1"),
+    RU("читает пути кадров из stdin по одному в строке вместо --frames; "
+       "называет маску по её кадру и печатает done <stem> или failed <stem> "
+       "с кодом выхода 1"),
+    TR("--frames yerine kare yollarını stdin'den satır başına bir tane okur; "
+       "her maskeye karesinin adını verir ve done <stem> basar, ya da failed "
+       "<stem> basıp 1 ile çıkar"));
+
+SS_MSG(trk_prime,
+    EN("with --follow: track this frame first to fill the memory; its mask "
+       "is not written"),
+    JA("--follow と使います。メモリを満たすため最初にこのフレームを追跡し、そのマスクは書きません"),
+    ZH_HANS("配合 --follow：先跟踪此帧以填充记忆，不写出它的遮罩"),
+    ZH_HANT("配合 --follow：先追蹤此影格以填充記憶，不寫出它的遮罩"),
+    KO("--follow 와 함께: 메모리를 채우려고 이 프레임을 먼저 추적하며, 그 "
+       "마스크는 쓰지 않습니다"),
+    DE("mit --follow: verfolgt zuerst dieses Bild, um den Speicher zu "
+       "füllen; seine Maske wird nicht geschrieben"),
+    FR("avec --follow : suit d'abord cette image pour remplir la mémoire ; "
+       "son masque n'est pas écrit"),
+    ES("con --follow: sigue primero este fotograma para llenar la memoria; "
+       "su máscara no se escribe"),
+    PT("com --follow: segue primeiro este quadro para encher a memória; a "
+       "sua máscara não é gravada"),
+    IT("con --follow: segue prima questo fotogramma per riempire la "
+       "memoria; la sua maschera non viene scritta"),
+    NL("met --follow: volgt eerst dit beeld om het geheugen te vullen; zijn"
+       " masker wordt niet geschreven"),
+    RU("с --follow: сначала отслеживает этот кадр, чтобы заполнить память; "
+       "его маска не записывается"),
+    TR("--follow ile: belleği doldurmak için önce bu kareyi izler; maskesi "
+       "yazılmaz"));
+
 SS_MSG(trk_out,
     EN("write a per-frame binary mask PNG"),
     JA("フレームごとの 2 値マスク PNG を書き出します"),
@@ -1099,6 +1159,81 @@ SS_MSG(xh_report,
     TR("seçilen her kare için bu CSV dosyasına bir satır yazar: numarası, "
        "piksel cinsinden kenar genişliği ve bulanıklığı, tutulup "
        "tutulmadığı"));
+
+SS_MSG(xh_plan_out,
+    EN("before the first frame, write the output folders and the frame plan"
+       " to this JSON file"),
+    JA("最初のフレームの前に、出力フォルダーとフレームの計画をこの JSON ファイルへ書き出します"),
+    ZH_HANS("在第一帧之前，把输出文件夹和帧计划写入此 JSON 文件"),
+    ZH_HANT("在第一格之前，把輸出資料夾和影格計畫寫入此 JSON 檔"),
+    KO("첫 프레임 전에 출력 폴더와 프레임 계획을 이 JSON 파일에 씁니다"),
+    DE("schreibt vor dem ersten Bild die Ausgabeordner und den Bildplan in "
+       "diese JSON-Datei"),
+    FR("écrit avant la première image les dossiers de sortie et le plan des"
+       " images dans ce fichier JSON"),
+    ES("antes del primer fotograma, escribe las carpetas de salida y el plan"
+       " de fotogramas en este archivo JSON"),
+    PT("antes do primeiro quadro, grava as pastas de saída e o plano de "
+       "quadros neste arquivo JSON"),
+    IT("prima del primo fotogramma scrive le cartelle di uscita e il piano "
+       "dei fotogrammi in questo file JSON"),
+    NL("schrijft vóór het eerste beeld de uitvoermappen en het beeldplan "
+       "naar dit JSON-bestand"),
+    RU("до первого кадра записывает папки вывода и план кадров в этот "
+       "JSON-файл"),
+    TR("ilk kareden önce çıktı klasörlerini ve kare planını bu JSON "
+       "dosyasına yazar"));
+
+SS_MSG(xh_plan_in,
+    EN("reuse the frame plan of a --plan-out file instead of measuring the "
+       "motion again; --keep must match"),
+    JA("動きを測り直す代わりに --plan-out ファイルのフレームの計画を使います。--keep は同じにします"),
+    ZH_HANS("沿用 --plan-out 文件中的帧计划，不再重新测量运动；--keep 必须相同"),
+    ZH_HANT("沿用 --plan-out 檔中的影格計畫，不再重新測量運動；--keep 必須相同"),
+    KO("움직임을 다시 재지 않고 --plan-out 파일의 프레임 계획을 씁니다. "
+       "--keep 은 같아야 합니다"),
+    DE("nutzt den Bildplan einer --plan-out-Datei, statt die Bewegung neu zu"
+       " messen; --keep muss gleich sein"),
+    FR("reprend le plan des images d'un fichier --plan-out au lieu de "
+       "remesurer le mouvement ; --keep doit être le même"),
+    ES("reutiliza el plan de fotogramas de un archivo --plan-out en vez de "
+       "medir otra vez el movimiento; --keep debe coincidir"),
+    PT("reutiliza o plano de quadros de um arquivo --plan-out em vez de "
+       "medir o movimento de novo; --keep deve ser igual"),
+    IT("riusa il piano dei fotogrammi di un file --plan-out invece di "
+       "rimisurare il movimento; --keep deve coincidere"),
+    NL("hergebruikt het beeldplan van een --plan-out-bestand in plaats van "
+       "de beweging opnieuw te meten; --keep moet gelijk zijn"),
+    RU("берёт план кадров из файла --plan-out вместо нового измерения "
+       "движения; --keep должен совпадать"),
+    TR("hareketi yeniden ölçmek yerine bir --plan-out dosyasının kare "
+       "planını kullanır; --keep aynı olmalı"));
+
+SS_MSG(xh_progress,
+    EN("append a JSON line to this file as frames reach the disk, in time "
+       "order; each frame is written under a temporary name first"),
+    JA("フレームがディスクに届くたびに、時間順でこのファイルへ JSON の行を足します。各フレームはまず一時的な名前で書きます"),
+    ZH_HANS("帧按时间顺序写到磁盘时，向此文件追加一行 JSON；每帧先以临时名称写入"),
+    ZH_HANT("影格按時間順序寫到磁碟時，向此檔追加一行 JSON；每格先以臨時名稱寫入"),
+    KO("프레임이 시간 순서대로 디스크에 닿으면 이 파일에 JSON 한 줄을 "
+       "덧붙입니다. 각 프레임은 먼저 임시 이름으로 씁니다"),
+    DE("hängt eine JSON-Zeile an diese Datei, sobald Bilder in zeitlicher "
+       "Folge auf der Platte sind; jedes Bild erst unter einem Zwischennamen"),
+    FR("ajoute une ligne JSON à ce fichier quand les images arrivent sur le"
+       " disque, dans l'ordre du temps ; chacune d'abord sous un nom "
+       "temporaire"),
+    ES("añade una línea JSON a este archivo cuando los fotogramas llegan al"
+       " disco, en orden de tiempo; cada uno primero con un nombre temporal"),
+    PT("acrescenta uma linha JSON a este arquivo quando os quadros chegam "
+       "ao disco, em ordem de tempo; cada um primeiro com um nome temporário"),
+    IT("aggiunge una riga JSON a questo file quando i fotogrammi arrivano "
+       "sul disco, in ordine di tempo; ognuno prima con un nome temporaneo"),
+    NL("voegt een JSON-regel aan dit bestand toe als beelden op schijf "
+       "staan, in volgorde van tijd; elk eerst onder een tijdelijke naam"),
+    RU("дописывает в этот файл строку JSON, когда кадры по порядку времени "
+       "попадают на диск; каждый сначала под временным именем"),
+    TR("kareler zaman sırasıyla diske ulaştıkça bu dosyaya bir JSON satırı "
+       "ekler; her kare önce geçici bir adla yazılır"));
 
 SS_MSG(xh_track,
     EN("video track to read; default is every track, written to <out>/cam0, "

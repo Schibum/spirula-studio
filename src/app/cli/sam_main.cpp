@@ -28,15 +28,28 @@
 #include "video/Video.h"
 #endif
 
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <future>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -115,6 +128,8 @@ void usage() {
     help_row("--detect-every <n>", H::trk_detect_every);
     help_row("--memory-frames <n>", H::trk_memory_frames);
     help_row("--max-frames <n>", H::trk_max_frames);
+    help_row("--follow", H::trk_follow);
+    help_row("--prime <file>", H::trk_prime);
     help_row("--out <dir>", H::trk_out);
     help_row("--detector <id|file>", H::opt_detector);
     help_row("--keep-prompted", H::trk_keep_prompted);
@@ -198,6 +213,8 @@ struct Options {
     int64_t cur_frame = 0;
     bool multimask = false, show_vram = false, profile = false, validate = false;
     bool overlay = false;
+    bool follow = false;
+    std::string prime;
     float threshold = 0.5f, nms = 0.1f;
     float dilate_ratio = 0.05f;   // sam::MaskOptions, same default
     int max_frames = 0;
@@ -281,6 +298,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--dark") o.border.dark = std::atoi(next("--dark"));
         else if (a == "--multimask") o.multimask = true;
         else if (a == "--overlay") o.overlay = true;
+        else if (a == "--follow") o.follow = true;
+        else if (a == "--prime") o.prime = next("--prime");
         else if (a == "--vram") o.show_vram = true;
         else if (a == "--profile") o.profile = true;
         else if (a == "--validate") o.validate = true;
@@ -506,30 +525,93 @@ int cmd_segment(const Options& o) {
     return 0;
 }
 
+// `track --follow`'s stdin, read on a thread of its own so that a frame never
+// waits on the next line. Raw reads, not std::cin: exit() takes the lock of a
+// FILE a blocked reader holds, so an error return would wait for stdin.
+class FollowLines {
+public:
+    FollowLines() : s_(std::make_shared<State>()) {
+        std::thread([s = s_] {
+            std::string line;
+            char buf[4096];
+            auto push = [&] {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) return;
+                std::lock_guard<std::mutex> lk(s->mu);
+                s->lines.push_back(std::move(line));
+                line.clear();
+                s->cv.notify_one();
+            };
+            for (;;) {
+#ifdef _WIN32
+                const int n = _read(0, buf, (unsigned)sizeof buf);
+#else
+                const ssize_t n = ::read(0, buf, sizeof buf);
+                if (n < 0 && errno == EINTR) continue;
+#endif
+                if (n <= 0) break;
+                for (int i = 0; i < (int)n; i++) {
+                    if (buf[i] == '\n') push();
+                    else line += buf[i];
+                }
+            }
+            push();
+            std::lock_guard<std::mutex> lk(s->mu);
+            s->eof = true;
+            s->cv.notify_one();
+        }).detach();
+    }
+    // 1 with `out` set, 0 at end of input, -1 when `wait` is false and no line is in yet.
+    int next(bool wait, std::string& out) {
+        std::unique_lock<std::mutex> lk(s_->mu);
+        if (wait) s_->cv.wait(lk, [&] { return s_->eof || !s_->lines.empty(); });
+        if (s_->lines.empty()) return s_->eof ? 0 : -1;
+        out = std::move(s_->lines.front());
+        s_->lines.pop_front();
+        return 1;
+    }
+
+private:
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool eof = false;
+    };
+    std::shared_ptr<State> s_;
+};
+
 int cmd_track(const Options& o) {
-    if (o.model.empty() || o.frames.empty()) {
+    if (o.model.empty() || (o.frames.empty() && !o.follow)) {
         std::fprintf(stderr, "%s\n", cmsg::sam_track_needs.get());
+        return 2;
+    }
+    if (o.follow && o.overlay) {
+        std::fprintf(stderr, "%s\n",
+                     format(cmsg::error_line, {"--follow does not write --overlay"}).c_str());
         return 2;
     }
     if (!app::require_model_license(o.model)) return 2;
     std::vector<std::string> files;
-    std::error_code ec;
-    for (const auto& e : fs::directory_iterator(o.frames, ec)) {
-        if (!e.is_regular_file()) continue;
-        std::string ext = e.path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" ||
-            ext == ".exr" || ext == ".tif" || ext == ".tiff")
-            files.push_back(e.path().string());
+    if (!o.follow) {
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(o.frames, ec)) {
+            if (!e.is_regular_file()) continue;
+            std::string ext = e.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" ||
+                ext == ".exr" || ext == ".tif" || ext == ".tiff")
+                files.push_back(e.path().string());
+        }
+        std::sort(files.begin(), files.end());
+        if (files.empty()) {
+            std::fprintf(stderr, "%s\n",
+                         format(cmsg::sam_no_images_in, {o.frames}).c_str());
+            return 1;
+        }
+        if (o.max_frames > 0 && (int)files.size() > o.max_frames)
+            files.resize((size_t)o.max_frames);
     }
-    std::sort(files.begin(), files.end());
-    if (files.empty()) {
-        std::fprintf(stderr, "%s\n",
-                     format(cmsg::sam_no_images_in, {o.frames}).c_str());
-        return 1;
-    }
-    if (o.max_frames > 0 && (int)files.size() > o.max_frames)
-        files.resize((size_t)o.max_frames);
 
     // The mask policy -- several concepts, negatives that carve back out, and
     // which side of the mask is white -- lives in sam/Masking.h, shared with
@@ -544,6 +626,36 @@ int cmd_track(const Options& o) {
         return 1;
     }
 
+    // With --follow, frame 0 is --prime when there is one: the tracker sees
+    // the sequence a folder run over [prime, stdin...] would.
+    const size_t primed = o.follow && !o.prime.empty() ? 1 : 0;
+    std::optional<FollowLines> lines;
+    if (o.follow) lines.emplace();
+    auto path_at = [&](size_t i, bool wait, std::string& p) {
+        if (!o.follow) {
+            if (i >= files.size()) return 0;
+            p = files[i];
+            return 1;
+        }
+        if (i < primed) {
+            p = o.prime;
+            return 1;
+        }
+        if (o.max_frames > 0 && i - primed >= (size_t)o.max_frames) return 0;
+        return lines->next(wait, p);
+    };
+
+    if (o.follow && !o.out_dir.empty()) app::remove_atomic_temps(o.out_dir);
+    std::mutex out_mu;
+    std::atomic<int> failed{0};
+    auto report = [&](bool ok, const std::string& stem) {
+        if (!o.follow) return;
+        if (!ok) ++failed;
+        std::lock_guard<std::mutex> lk(out_mu);
+        std::printf("%s %s\n", ok ? "done" : "failed", stem.c_str());
+        std::fflush(stdout);
+    };
+
     // Neither reading the next frame nor writing the last mask needs the GPU,
     // and together they are about a third of a frame -- see app/WriterPool.h.
     app::WriterPool writers;
@@ -552,28 +664,44 @@ int cmd_track(const Options& o) {
     struct Loaded {
         nn::Image img;
         sfm::ExifTransform turn;
+        std::string path;
     };
     std::future<Loaded> ahead;
-    auto load_at = [&](size_t i) {
+    auto load_path = [&](const std::string& path) {
         return std::async(std::launch::async,
-                          [p = files[i], g = o.image_gamut, l = o.image_is_linear,
+                          [p = path, g = o.image_gamut, l = o.image_is_linear,
                            e = o.image_exposure] {
                               Loaded out;
                               out.img = app::load_upright(p, g, l, e, out.turn);
+                              out.path = p;
                               return out;
                           });
     };
-    if (!files.empty()) ahead = load_at(0);
+    auto start = [&](size_t i, bool wait) {
+        std::string p;
+        const int got = path_at(i, wait, p);
+        if (got == 1) ahead = load_path(p);
+        return got;
+    };
 
     double t_load = 0, t_track = 0, t_write = 0;
+    size_t count = 0;
     const double t_all = nn::now_ms();
-    for (size_t f = 0; f < files.size(); ++f) {
+    int next = start(0, true);
+    for (size_t f = 0; next != 0; ++f) {
         double t0 = nn::now_ms();
+        if (next < 0 && (next = start(f, true)) == 0) break;
         Loaded loaded = ahead.get();
         nn::Image frame = std::move(loaded.img);
-        if (f + 1 < files.size()) ahead = load_at(f + 1);
+        next = start(f + 1, false);
         t_load += nn::now_ms() - t0;
-        if (frame.empty()) continue;
+        ++count;
+        const bool write = f >= primed;
+        const std::string stem = fs::path(loaded.path).stem().string();
+        if (frame.empty()) {
+            if (write) report(false, stem);
+            continue;
+        }
 
         t0 = nn::now_ms();
         sam::Mask mask;
@@ -581,6 +709,7 @@ int cmd_track(const Options& o) {
         if (!masker.run(frame, mask, o.overlay ? &r : nullptr, (int64_t)f)) {
             std::fprintf(stderr, "%s\n",
                          format(cmsg::error_line, {masker.lastError()}).c_str());
+            if (write) report(false, stem);
             return 1;
         }
         t_track += nn::now_ms() - t0;
@@ -596,14 +725,16 @@ int cmd_track(const Options& o) {
             std::fprintf(stderr, "%s\n",
                          format(cmsg::sam_frame_line,
                                 {(long long)f,
-                                 fs::path(files[f]).filename().string(),
+                                 fs::path(loaded.path).filename().string(),
                                  pct}).c_str());
         }
-        if (!o.out_dir.empty()) {
+        if (!o.out_dir.empty() && write) {
             std::error_code dec;
             fs::create_directories(o.out_dir, dec);
-            char path[512];
-            std::snprintf(path, sizeof path, "%s/frame_%05zu.png", o.out_dir.c_str(), f);
+            char numbered[32];
+            std::snprintf(numbered, sizeof numbered, "frame_%05zu.png", f);
+            const std::string path =
+                (fs::path(o.out_dir) / (o.follow ? stem + ".png" : numbered)).string();
             if (o.overlay) {
                 sam::save_overlay_png(frame, r, path);
             } else {
@@ -612,14 +743,20 @@ int cmd_track(const Options& o) {
                 app::WriteJob wj;
                 wj.mask = std::move(mask);
                 wj.path = path;
+                if (o.follow) {
+                    wj.atomic = true;
+                    wj.done = [&report, stem](bool ok) { report(ok, stem); };
+                }
                 writers.submit(std::move(wj));
             }
+        } else if (write) {
+            report(true, stem);
         }
         t_write += nn::now_ms() - t0;
     }
     writers.finish();
     const double total = nn::now_ms() - t_all;
-    const double n = (double)files.size();
+    const double n = (double)std::max<size_t>(count, 1);
     {
         auto ms = [](double v) {
             char b[32];
@@ -630,14 +767,14 @@ int cmd_track(const Options& o) {
         std::snprintf(secs, sizeof secs, "%.1f", total / 1000.0);
         std::fprintf(stderr, "%s\n",
                      format(cmsg::sam_track_summary,
-                            {(long long)files.size(), secs, ms(total / n),
+                            {(long long)count, secs, ms(total / n),
                              ms(t_load / n), ms(t_track / n),
                              ms(t_write / n)}).c_str());
     }
     if (o.show_vram)
         std::fprintf(stderr, "VRAM:\n%s", masker.session().vramReport().c_str());
     if (o.profile) masker.session().printProfile();
-    return 0;
+    return failed.load() ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
