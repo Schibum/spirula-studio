@@ -35,6 +35,7 @@
 #include <atomic>
 #include <limits>
 #include <set>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -44,6 +45,7 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -85,6 +87,7 @@ struct Options {
     Tri  split = Tri::Auto;
     app::FaceRes face_res = app::FaceRes::Output;
     bool overwrite = false;
+    int  every = 1;
     bool worker = false;
     std::string worker_devices;
     uint64_t worker_memory = app::default_worker_memory_bytes();
@@ -128,6 +131,7 @@ void usage() {
     help_row("--ray-depth auto|yes|no", G::opt_ray_depth);
     help_row("--split auto|yes|no", G::opt_split);
     help_row("--face-res output|source", G::opt_face_res);
+    help_row("--every <n>", G::opt_every);
     help_row("--overwrite", G::opt_overwrite);
     help_row("--image-gamut <name>", G::opt_image_gamut);
     help_row("--image-linear / --no-image-linear", G::opt_image_linear);
@@ -724,6 +728,36 @@ std::string camera_key(const ParsedDataset& ds, int64_t i) {
     return k;
 }
 
+// Few threads, because each holds sha256_file's 16 MiB buffer.
+std::vector<std::string> hash_files(const std::vector<std::string>& paths) {
+    std::vector<std::string> out(paths.size());
+    std::atomic<size_t> next{0};
+    auto run = [&] {
+        for (size_t j; (j = next++) < paths.size();) out[j] = spirula::sha256_file(paths[j]);
+    };
+    const size_t n = std::min<size_t>({8, std::max(1u, spirula::hardware_threads()), paths.size()});
+    std::vector<std::thread> pool;
+    for (size_t t = 1; t < n; ++t) pool.emplace_back(run);
+    run();
+    for (std::thread& t : pool) t.join();
+    return out;
+}
+
+// --every: the n-th of the sorted file names, so the frames of one instant
+// in several camera folders are kept or dropped together.
+std::vector<bool> every_nth(const ParsedDataset& ds, int every) {
+    const size_t n = ds.image_filenames.size();
+    std::vector<bool> keep(n, true);
+    if (every <= 1) return keep;
+    std::map<std::string, size_t> rank;
+    for (const std::string& f : ds.image_filenames) rank[fs::path(f).filename().string()] = 0;
+    size_t r = 0;
+    for (auto& kv : rank) kv.second = r++;
+    for (size_t i = 0; i < n; ++i)
+        keep[i] = rank[fs::path(ds.image_filenames[i]).filename().string()] % (size_t)every == 0;
+    return keep;
+}
+
 std::string gb(uint64_t b) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.1f GB", b / 1e9);
@@ -805,6 +839,7 @@ int spirula_geometry_main(int argc, char** argv) {
             else { usage(); return 2; }
         }
         else if (a == "--overwrite") o.overwrite = true;
+        else if (a == "--every") o.every = std::max(1, std::atoi(next()));
         else if (a == "--worker") o.worker = true;
         else if (a == "--worker-threads") o.worker_threads = std::max(1, std::atoi(next()));
         else if (a == "--worker-devices") o.worker_devices = next();
@@ -1041,12 +1076,22 @@ int spirula_geometry_main(int argc, char** argv) {
             int64_t i = 0;
             fs::path np, dp;
             bool normal = false, depth = false;
-            std::string key;
+            // `key` is the source's hash, then `key_rest`. Empty until hashed: a
+            // map that is not on disk is redone whatever the key, so its frame
+            // is hashed when it is read rather than before the first one runs.
+            std::string key, key_rest;
         };
-        std::vector<Todo> todo;
-        std::vector<Todo> retained;
+        const std::vector<bool> chosen = every_nth(ds, o.every);
+        const int64_t N_run = (int64_t)std::count(chosen.begin(), chosen.end(), true);
+        const bool lazy_keys = !o.worker && worker_devices.empty();
+        auto on_disk = [](const fs::path& path) {
+            std::error_code e;
+            return !path.empty() && fs::is_regular_file(path, e) && fs::file_size(path, e) > 0 && !e;
+        };
+        std::vector<Todo> planned;
         std::set<fs::path> owned;
         for (int64_t i = 0; i < N; ++i) {
+            if (!chosen[(size_t)i]) continue;
             // out_path creates the folder it names, so a map that was not asked
             // for must not have its path built: it would leave an empty depths/
             // in the dataset for a normals-only run.
@@ -1068,10 +1113,7 @@ int spirula_geometry_main(int argc, char** argv) {
                 }
             }
             const WarpInfo& warp = warps[(size_t)group[(size_t)i]];
-            const std::string source = spirula::sha256_file(ds.image_filenames[(size_t)i]);
-            NN_CHECK(!source.empty(), "cannot hash geometry source %s",
-                     ds.image_filenames[(size_t)i].c_str());
-            t.key = source + "|" + keys[(size_t)i] + "|" +
+            t.key_rest = keys[(size_t)i] + "|" +
                 o.model + "|" + std::to_string(warp.out_w) + "," +
                 std::to_string(warp.out_h) + "," + std::to_string(warp.faces) + "|" +
                 std::to_string(o.max_size) + "," + std::to_string(o.num_tokens) + "," +
@@ -1081,11 +1123,31 @@ int spirula_geometry_main(int argc, char** argv) {
                 (o.image_is_linear ? (*o.image_is_linear ? "linear" : "srgb") : "auto") + "|" +
                 std::to_string(o.image_exposure.automatic) + "," +
                 std::to_string(o.image_exposure.stops);
+            planned.push_back(std::move(t));
+        }
+        {
+            std::vector<size_t> need;
+            std::vector<std::string> files;
+            for (size_t j = 0; j < planned.size(); ++j) {
+                const Todo& t = planned[j];
+                if (lazy_keys && (o.overwrite || (!on_disk(t.np) && !on_disk(t.dp)))) continue;
+                need.push_back(j);
+                files.push_back(ds.image_filenames[(size_t)t.i]);
+            }
+            const std::vector<std::string> hashes = hash_files(files);
+            for (size_t k = 0; k < need.size(); ++k) {
+                NN_CHECK(!hashes[k].empty(), "cannot hash geometry source %s", files[k].c_str());
+                planned[need[k]].key = hashes[k] + "|" + planned[need[k]].key_rest;
+            }
+        }
+        std::vector<Todo> todo;
+        std::vector<Todo> retained;
+        for (Todo& t : planned) {
             const std::string normal_key = t.key + "|normal|" + o.normal_format + "|" +
                                            std::to_string(o.jpeg_quality);
-            t.normal = o.want_normal && (o.overwrite ||
+            t.normal = o.want_normal && (o.overwrite || t.key.empty() ||
                 !app::geometry_output_complete(t.np, normal_key));
-            t.depth = o.want_depth && (o.overwrite ||
+            t.depth = o.want_depth && (o.overwrite || t.key.empty() ||
                 !app::geometry_output_complete(t.dp, t.key + "|depth"));
             if (!o.overwrite) {
                 for (const auto& path : {t.np, t.dp}) {
@@ -1105,49 +1167,88 @@ int spirula_geometry_main(int argc, char** argv) {
         auto normal_key = [&](const Todo& t) {
             return t.key + "|normal|" + o.normal_format + "|" + std::to_string(o.jpeg_quality);
         };
-        auto complete = [&](const Todo& t) {
-            return (!o.want_normal || app::geometry_output_complete(t.np, normal_key(t))) &&
-                   (!o.want_depth || app::geometry_output_complete(t.dp, t.key + "|depth"));
+        auto complete = [&](const Todo& t, const std::string& key) {
+            const std::string nk = key + "|normal|" + o.normal_format + "|" +
+                                   std::to_string(o.jpeg_quality);
+            return (!o.want_normal || app::geometry_output_complete(t.np, nk)) &&
+                   (!o.want_depth || app::geometry_output_complete(t.dp, key + "|depth"));
         };
-        std::optional<app::GeometryWarp> current_warp;
+        std::shared_ptr<const app::GeometryWarp> current_warp;
         size_t current_group = group_first.size();
         auto process = [&](const std::vector<Todo>& todo) {
         app::WriterPool writers(o.worker ? (int)o.worker_threads : 0);
+        std::vector<std::string> todo_keys(todo.size());
+        for (size_t j = 0; j < todo.size(); ++j) todo_keys[j] = todo[j].key;
 
-        // Empty when the file does not decode.
-        auto read_at = [&](size_t j) {
+        struct Loaded {
+            std::string hash;   // set when the plan left the key to the read
+            sfm::ExifTransform turn;
+            std::vector<float> src;                  // the sample grid, until sampled
+            std::vector<std::vector<float>> faces;   // sampled and turned
+        };
+        // Given `warp`, the faces are sampled here too, so the thread feeding the
+        // device does nothing but feed it.
+        auto read_at = [&](size_t j, std::shared_ptr<const app::GeometryWarp> warp) {
             const int64_t i = todo[j].i;
-            return std::async(std::launch::async, [&, i] {
-                const WarpInfo& warp = warps[(size_t)group[(size_t)i]];
+            const bool hash = todo[j].key.empty();
+            return std::async(std::launch::async, [&, i, hash, warp] {
+                Loaded l;
+                const std::string& file = ds.image_filenames[(size_t)i];
+                if (hash) {
+                    l.hash = spirula::sha256_file(file);
+                    NN_CHECK(!l.hash.empty(), "cannot hash geometry source %s", file.c_str());
+                }
+                const WarpInfo& info = warps[(size_t)group[(size_t)i]];
                 const nn::Image img =
-                    nn::load_image(ds.image_filenames[(size_t)i], o.image_gamut,
-                                   o.image_is_linear, o.image_exposure);
-                if (img.empty()) return std::vector<float>();
-                return app::resize_area(img.data.data(), img.width, img.height,
-                                        img.channels, warp.sample_w,
-                                        warp.sample_h);
+                    nn::load_image(file, o.image_gamut, o.image_is_linear, o.image_exposure);
+                NN_CHECK(!img.empty(), "cannot decode geometry source %s", file.c_str());
+                l.src = app::resize_area(img.data.data(), img.width, img.height,
+                                         img.channels, info.sample_w, info.sample_h);
+                // The network was trained upright, and a face cut from a photo
+                // stored sideways is sideways. Turned for the forward pass and
+                // back before the blend, so the maps stay in the stored frame.
+                l.turn = app::photo_turn(file);
+                if (warp) {
+                    for (int k = 0; k < warp->faces(); ++k) {
+                        std::vector<float> rgb;
+                        warp->sampleFace(k, l.src.data(), rgb);
+                        int fw = warp->faceWidth(k), fh = warp->faceHeight(k);
+                        app::turn_pixels(l.turn, 3, rgb, fw, fh);
+                        l.faces.push_back(std::move(rgb));
+                    }
+                    std::vector<float>().swap(l.src);
+                }
+                return l;
             });
         };
 
         // Whole frames, as many as the model takes faces of at once (one where
         // batching buys nothing), of one camera and wanting the same maps. The
         // next batch is read while this one runs.
-        std::map<size_t, std::future<std::vector<float>>> ahead;
+        std::map<size_t, std::future<Loaded>> ahead;
         size_t next_read = 0;
         auto read_until = [&](size_t end) {
-            for (; next_read < std::min(end, todo.size()); ++next_read)
-                ahead[next_read] = read_at(next_read);
+            for (; next_read < std::min(end, todo.size()); ++next_read) {
+                const bool same = (size_t)group[(size_t)todo[next_read].i] == current_group;
+                ahead[next_read] = read_at(next_read, same ? current_warp : nullptr);
+            }
         };
+        // The previous batch's host half -- MoGe's remap and shift, the blend,
+        // the encoding -- runs here while the device runs the next batch.
+        // Declared after `writers`, so an unwinding throw waits for it first.
+        std::future<void> finishing;
 
         for (size_t j0 = 0; j0 < todo.size();) {
             const size_t g = (size_t)group[(size_t)todo[j0].i];
             if (g != current_group) {
                 // Release the previous maps before allocating the next camera's maps.
+                if (finishing.valid()) finishing.get();
                 current_warp.reset();
-                current_warp.emplace(make_warp(g));
+                current_warp = std::make_shared<const app::GeometryWarp>(make_warp(g));
                 current_group = g;
             }
-            const app::GeometryWarp& warp = *current_warp;
+            const std::shared_ptr<const app::GeometryWarp> warp_ref = current_warp;
+            const app::GeometryWarp& warp = *warp_ref;
             const size_t per = o.worker ? 1 : std::max<size_t>(
                 1, (size_t)pred.batchCapacity(app::face_request(warp, 0, o.num_tokens)) /
                        (size_t)std::max(1, warp.faces()));
@@ -1166,40 +1267,47 @@ int spirula_geometry_main(int argc, char** argv) {
             std::vector<std::vector<float>> face_rgb;
             std::vector<app::GeometryRequest> reqs;
             for (size_t j = j0; j < j1; ++j) {
-                const int64_t i = todo[j].i;
-                const std::vector<float> src = ahead[j].get();
+                Loaded l = ahead[j].get();
                 ahead.erase(j);
-                NN_CHECK(!src.empty(), "cannot decode geometry source %s",
-                         ds.image_filenames[(size_t)i].c_str());
-                // The network was trained upright, and a face cut from a photo
-                // stored sideways is sideways. Turned for the forward pass and
-                // back before the blend, so the maps stay in the stored frame.
-                const sfm::ExifTransform turn =
-                    app::photo_turn(ds.image_filenames[(size_t)i]);
+                if (!l.hash.empty()) todo_keys[j] = l.hash + "|" + todo[j].key_rest;
+                const sfm::ExifTransform turn = l.turn;
                 frames.push_back({j, app::inverse_turn(turn), reqs.size()});
                 for (int k = 0; k < warp.faces(); ++k) {
-                    std::vector<float> rgb;
-                    warp.sampleFace(k, src.data(), rgb);
                     app::GeometryRequest rq = app::face_request(warp, k, o.num_tokens);
                     rq.refine_steps = o.refine_steps;
                     rq.want_depth = todo[j].depth;
                     rq.want_normal = todo[j].normal;
-                    int fw = rq.width, fh = rq.height;
-                    app::turn_pixels(turn, 3, rgb, fw, fh);
+                    if (l.faces.empty()) {
+                        std::vector<float> rgb;
+                        warp.sampleFace(k, l.src.data(), rgb);
+                        int fw = rq.width, fh = rq.height;
+                        app::turn_pixels(turn, 3, rgb, fw, fh);
+                        face_rgb.push_back(std::move(rgb));
+                    } else {
+                        face_rgb.push_back(std::move(l.faces[(size_t)k]));
+                    }
                     reqs.push_back(app::turn_request(rq, turn));
-                    face_rgb.push_back(std::move(rgb));
                 }
             }
             const double t0 = nn::now_ms();
             std::vector<const float*> faces;
             for (const std::vector<float>& f : face_rgb) faces.push_back(f.data());
-            std::vector<app::GeometryPrediction> preds =
-                faces.empty() ? std::vector<app::GeometryPrediction>()
-                              : pred.predictBatch(faces, reqs);
-            NN_CHECK(preds.size() == reqs.size(), "the network returned %zu of %zu faces",
-                     preds.size(), reqs.size());
+            app::GeometryModel::Finish finish =
+                faces.empty() ? app::GeometryModel::Finish()
+                              : pred.predictBatchDeferred(faces, reqs);
             model_ms += nn::now_ms() - t0;
             modeled += (int64_t)frames.size();
+            std::vector<std::vector<float>>().swap(face_rgb);
+
+            if (finishing.valid()) finishing.get();
+            finishing = std::async(std::launch::async,
+                [&, warp_ref, frames = std::move(frames), reqs = std::move(reqs),
+                 finish = std::move(finish), each = model_ms / (double)std::max<int64_t>(modeled, 1)] {
+            const app::GeometryWarp& warp = *warp_ref;
+            std::vector<app::GeometryPrediction> preds =
+                finish ? finish() : std::vector<app::GeometryPrediction>();
+            NN_CHECK(preds.size() == reqs.size(), "the network returned %zu of %zu faces",
+                     preds.size(), reqs.size());
 
             for (const Frame& f : frames) {
                 const size_t j = f.j;
@@ -1251,7 +1359,7 @@ int spirula_geometry_main(int argc, char** argv) {
                 if (need_normal) {
                     app::WriteJob job;
                     job.path = np.string();
-                    job.geometry_key = todo[j].key + "|normal|" + o.normal_format + "|" +
+                    job.geometry_key = todo_keys[j] + "|normal|" + o.normal_format + "|" +
                                        std::to_string(o.jpeg_quality);
                     job.geometry_overwrite = o.overwrite;
                     // A quality INSIDE 0..100 is what selects JPEG; the extension
@@ -1284,7 +1392,7 @@ int spirula_geometry_main(int argc, char** argv) {
                     const float inv = o.depth_mm ? 1.0f : 1.0f / depth_scale(depth);
                     app::WriteJob job;
                     job.path = dp.string();
-                    job.geometry_key = todo[j].key + "|depth";
+                    job.geometry_key = todo_keys[j] + "|depth";
                     job.geometry_overwrite = o.overwrite;
                     job.depth_w = warp.outWidth();
                     job.depth_h = warp.outHeight();
@@ -1300,10 +1408,9 @@ int spirula_geometry_main(int argc, char** argv) {
 
                 ++written;
                 if (!o.worker) {
-                    const double each = model_ms / (double)std::max<int64_t>(modeled, 1);
                     std::printf("%s\n",
                                 format(G::log_progress,
-                                       {(long long)(written + skipped), (long long)N,
+                                       {(long long)(written + skipped), (long long)N_run,
                                         (long long)std::lround(each),
                                         format_duration(each * (double)(todo.size() - j - 1) /
                                                         1000.0)})
@@ -1311,12 +1418,15 @@ int spirula_geometry_main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
             }
+            });
             j0 = j1;
         }
+        if (finishing.valid()) finishing.get();
         writers.finish();
         NN_CHECK(writers.failures() == 0, "geometry writers failed");
-        for (const auto& t : todo)
-            NN_CHECK(complete(t), "incomplete geometry for image %lld", (long long)t.i);
+        for (size_t j = 0; j < todo.size(); ++j)
+            NN_CHECK(complete(todo[j], todo_keys[j]), "incomplete geometry for image %lld",
+                     (long long)todo[j].i);
         };
         if (o.worker) {
             std::set<int64_t> assigned;
@@ -1366,7 +1476,7 @@ int spirula_geometry_main(int argc, char** argv) {
                 for (const auto& task : pending) {
                     const auto hash = spirula::sha256_file(ds.image_filenames[(size_t)task.i]);
                     NN_CHECK(!hash.empty() && task.key.compare(0, hash.size() + 1, hash + "|") == 0 &&
-                             complete(task), "geometry worker did not complete the frozen image");
+                             complete(task, task.key), "geometry worker did not complete the frozen image");
                 }
                 NN_CHECK(app::worker_write_frame(frame), "geometry worker acknowledgement failed");
             }
@@ -1472,13 +1582,13 @@ int spirula_geometry_main(int argc, char** argv) {
                                          "invalid staged geometry dimensions");
                             }
                             app::publish_geometry_family(families[index], o.overwrite);
-                            NN_CHECK(complete(t), "published geometry family is incomplete");
+                            NN_CHECK(complete(t, t.key), "published geometry family is incomplete");
                             ++written;
                             const double each = (nn::now_ms() - t_start) / written;
                             std::printf("%s\n", format(G::log_progress,
-                                {(long long)(written + skipped), (long long)N,
+                                {(long long)(written + skipped), (long long)N_run,
                                  (long long)std::lround(each),
-                                 format_duration(each * (N - written - skipped) / 1000.0)}).c_str());
+                                 format_duration(each * (N_run - written - skipped) / 1000.0)}).c_str());
                             std::fflush(stdout);
                         }
                         return true;
@@ -1491,7 +1601,7 @@ int spirula_geometry_main(int argc, char** argv) {
             process(todo);
         }
         for (const auto& t : retained)
-            NN_CHECK(complete(t), "retained geometry family is incomplete for image %lld",
+            NN_CHECK(complete(t, t.key), "retained geometry family is incomplete for image %lld",
                      (long long)t.i);
         std::printf("\r%s\n",
                     format(G::log_done,

@@ -15,6 +15,7 @@
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <memory>
 
 namespace app {
 namespace {
@@ -78,6 +79,30 @@ bool graph_is_moge(const nn::OnnxFile& graph, const std::string& path) {
 bool file_is_moge(const std::string& path) {
     if (path.size() > 3 && path.compare(path.size() - 3, 3, ".pt") == 0) return true;
     return graph_is_moge(nn::read_onnx_structure(path), path);
+}
+
+moge::PredictOptions moge_options(const GeometryRequest& req) {
+    moge::PredictOptions po;
+    po.want_depth = req.want_depth;
+    po.want_normal = req.want_normal;
+    po.want_mask = true;
+    po.num_tokens = req.num_tokens;
+    po.refine_steps = req.refine_steps;
+    po.fx = (float)req.fx;
+    po.fy = (float)req.fy;
+    po.cx = (float)req.cx;
+    po.cy = (float)req.cy;
+    return po;
+}
+
+GeometryPrediction from_moge(moge::Prediction&& p) {
+    GeometryPrediction out;
+    out.width = p.width;
+    out.height = p.height;
+    out.depth = std::move(p.depth);
+    out.normal = std::move(p.normal);
+    out.mask = std::move(p.mask);
+    return out;
 }
 
 }  // namespace
@@ -297,28 +322,36 @@ std::vector<GeometryPrediction> GeometryModel::predictBatch(
     return out;
 }
 
+GeometryModel::Finish GeometryModel::predictBatchDeferred(
+    const std::vector<const float*>& rgb, const std::vector<GeometryRequest>& reqs) {
+    if (!impl_->is_moge || impl_->is_marigold) {
+        auto done = std::make_shared<std::vector<GeometryPrediction>>(predictBatch(rgb, reqs));
+        return [done] { return std::move(*done); };
+    }
+    struct Raw {
+        moge::RawPrediction raw;
+        moge::PredictOptions po;
+    };
+    auto raws = std::make_shared<std::vector<Raw>>();
+    raws->reserve(rgb.size());
+    for (size_t i = 0; i < rgb.size(); ++i) {
+        const moge::PredictOptions po = moge_options(reqs[i]);
+        raws->push_back({impl_->moge.run(rgb[i], reqs[i].width, reqs[i].height, po), po});
+    }
+    return [raws] {
+        std::vector<GeometryPrediction> out;
+        out.reserve(raws->size());
+        for (Raw& r : *raws)
+            out.push_back(from_moge(moge::Predictor::finish(std::move(r.raw), r.po)));
+        return out;
+    };
+}
+
 GeometryPrediction GeometryModel::predict(const float* rgb, const GeometryRequest& req) {
     if (impl_->is_marigold) return std::move(predictBatch({rgb}, {req})[0]);
+    if (impl_->is_moge)
+        return from_moge(impl_->moge.predict(rgb, req.width, req.height, moge_options(req)));
     GeometryPrediction out;
-    if (impl_->is_moge) {
-        moge::PredictOptions po;
-        po.want_depth = req.want_depth;
-        po.want_normal = req.want_normal;
-        po.want_mask = true;
-        po.num_tokens = req.num_tokens;
-        po.refine_steps = req.refine_steps;
-        po.fx = (float)req.fx;
-        po.fy = (float)req.fy;
-        po.cx = (float)req.cx;
-        po.cy = (float)req.cy;
-        moge::Prediction p = impl_->moge.predict(rgb, req.width, req.height, po);
-        out.width = p.width;
-        out.height = p.height;
-        out.depth = std::move(p.depth);
-        out.normal = std::move(p.normal);
-        out.mask = std::move(p.mask);
-        return out;
-    }
     metric3d::PredictOptions po;
     po.want_depth = req.want_depth;
     po.want_normal = req.want_normal;

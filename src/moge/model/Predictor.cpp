@@ -1,9 +1,9 @@
 // The public surface: a checkpoint, an arena, and one image at a time.
 //
-// The device produces the three heads' RAW maps at the caller's resolution and
-// everything after that is host arithmetic -- the exp remap, the normalization,
-// the sigmoid, and the shift that turns an affine point map into a depth map.
-// All four are one pass over a map we have to download anyway.
+// The device produces the three heads' RAW maps at the caller's resolution
+// (run()) and everything after that is host arithmetic (finish()) -- the exp
+// remap, the normalization, the sigmoid, and the shift that turns an affine
+// point map into a depth map.
 
 #include "moge/Moge.h"
 
@@ -125,6 +125,11 @@ uint64_t Model::planArenaBytes(int64_t gh, int64_t gw, int64_t H, int64_t W) con
 
 Prediction Predictor::predict(const float* rgb, int width, int height,
                               const PredictOptions& opts) {
+    return finish(run(rgb, width, height, opts), opts);
+}
+
+RawPrediction Predictor::run(const float* rgb, int width, int height,
+                             const PredictOptions& opts) {
     Model& m = impl_->model;
     NN_CHECK(m.weights.loaded(), "moge::Predictor::predict before load()");
     NN_CHECK(rgb != nullptr && width > 0 && height > 0,
@@ -206,23 +211,36 @@ Prediction Predictor::predict(const float* rgb, int width, int height,
              (double)reserved / 1e6, (double)m.arena.capacity() / 1e6);
 
     const size_t n = (size_t)height * width;
-    std::vector<float> points, normal;
+    RawPrediction raw;
+    raw.width = width;
+    raw.height = height;
+    if (o.points.valid()) {
+        raw.points.resize(n * 3);
+        nn::tensor_to_host(o.points, raw.points.data(), o.points.numel());
+    }
+    if (o.normal.valid()) {
+        raw.normal.resize(n * 3);
+        nn::tensor_to_host(o.normal, raw.normal.data(), o.normal.numel());
+    }
+    if (o.mask.valid()) {
+        raw.mask.resize(n);
+        nn::tensor_to_host(o.mask, raw.mask.data(), o.mask.numel());
+    }
+    if (o.scale.valid()) nn::tensor_to_host(o.scale, &raw.metric_scale, 1);
+    NN_LOG_DEBUG("[moge] %dx%d -> %lldx%lld tokens, arena %.0f MB\n", width, height,
+                 (long long)gh, (long long)gw, (double)m.arena.highWater() / 1e6);
+    return raw;
+}
+
+Prediction Predictor::finish(RawPrediction&& raw, const PredictOptions& opts) {
+    const int width = raw.width, height = raw.height;
+    const size_t n = (size_t)height * width;
+    std::vector<float> points = std::move(raw.points), normal = std::move(raw.normal);
     Prediction out;
     out.width = width;
     out.height = height;
-    if (o.points.valid()) {
-        points.resize(n * 3);
-        nn::tensor_to_host(o.points, points.data(), o.points.numel());
-    }
-    if (o.normal.valid()) {
-        normal.resize(n * 3);
-        nn::tensor_to_host(o.normal, normal.data(), o.normal.numel());
-    }
-    if (o.mask.valid()) {
-        out.mask.resize(n);
-        nn::tensor_to_host(o.mask, out.mask.data(), o.mask.numel());
-    }
-    if (o.scale.valid()) nn::tensor_to_host(o.scale, &out.metric_scale, 1);
+    out.mask = std::move(raw.mask);
+    out.metric_scale = raw.metric_scale;
 
     // ---- the remap, the normalization and the sigmoid -----------------------
     nn::parallel_for((int64_t)n, [&](int64_t i0, int64_t i1) {
@@ -305,11 +323,8 @@ Prediction Predictor::predict(const float* rgb, int width, int height,
     }
     if (!opts.want_mask) std::vector<float>().swap(out.mask);
 
-    NN_LOG_DEBUG("[moge] %dx%d -> %lldx%lld tokens, scale %.3f, shift %.4f, focal %.4f, "
-                 "arena %.0f MB\n",
-                 width, height, (long long)gh, (long long)gw, (double)out.metric_scale,
-                 (double)out.shift, (double)out.focal,
-                 (double)m.arena.highWater() / 1e6);
+    NN_LOG_DEBUG("[moge] scale %.3f, shift %.4f, focal %.4f\n", (double)out.metric_scale,
+                 (double)out.shift, (double)out.focal);
     return out;
 }
 

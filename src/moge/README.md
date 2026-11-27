@@ -337,7 +337,11 @@ bug cannot hide under the rounding; neither is a quality knob.
 ## Not done yet
 
 - **Batching the faces.** A split frame runs its faces through the network
-  one at a time, as `src/metric3d/` does.
+  one at a time, as `src/metric3d/` does. What `spirula geometry` does instead
+  is overlap: `Predictor::run()` is the device half and `finish()` the host
+  half, and a frame's host half -- with the blend and the encoding -- runs
+  while the device works on the next frame. The maps are the same bytes as
+  `predict()`'s; a batch would also hide the wait on each face's download.
 - **The panorama path.** MoGe ships an `infer_panorama.py` that splits an
   equirectangular frame into 12 overlapping views and merges in the spherical
   domain. `app/GeometryWarp.h`'s 6-face cube map with a log-median alignment is

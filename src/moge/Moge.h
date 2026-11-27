@@ -62,6 +62,15 @@ struct Prediction {
     float focal = 0.0f;
 };
 
+// The heads' maps as they leave the device: predict()'s host half has not run.
+struct RawPrediction {
+    int width = 0, height = 0;
+    std::vector<float> points;   // [H*W*3] xy slope and log z
+    std::vector<float> normal;   // [H*W*3] not yet unit length
+    std::vector<float> mask;     // [H*W] logits
+    float metric_scale = 1.0f;
+};
+
 // Owns a checkpoint and the working buffers for one image at a time. Not
 // thread-safe: one Predictor per thread, and they share the process-wide
 // inference device.
@@ -85,6 +94,13 @@ public:
     // `rgb` is width*height*3 floats in 0..1, row-major, interleaved.
     Prediction predict(const float* rgb, int width, int height,
                        const PredictOptions& opts = {});
+
+    // predict() in two halves, so the host half of one image can run while the
+    // device runs the next: run() holds the device, finish() is host arithmetic
+    // safe on any thread. finish(run(...)) is predict(), bit for bit.
+    RawPrediction run(const float* rgb, int width, int height,
+                      const PredictOptions& opts = {});
+    static Prediction finish(RawPrediction&& raw, const PredictOptions& opts = {});
 
     // Bytes this Predictor is holding on the device.
     uint64_t deviceBytes() const;

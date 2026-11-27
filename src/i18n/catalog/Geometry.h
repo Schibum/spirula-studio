@@ -378,6 +378,34 @@ SS_MSG(opt_image_exposure,
        "tipik bir fotoğraftan koyu olan her görüntüyü yükseltir; ya da bir durak "
        "sayısı verin."));
 
+SS_MSG(opt_every,
+    EN("Maps only for every n-th frame, by file name; frames of one name in "
+       "several camera folders stay together. 1 (default) maps all."),
+    JA("n 枚ごとに 1 枚だけマップを作ります (ファイル名順)。 カメラのフォルダーにある"
+       "同じ名前のフレームはまとめて扱います。 1 (既定) ですべて作ります。"),
+    ZH_HANS("每 n 帧只为一帧生成图（按文件名排序）；各相机文件夹中同名的帧一起处理。"
+            "1（默认）生成全部。"),
+    ZH_HANT("每 n 幀只為一幀產生圖（依檔案名稱排序）；各相機資料夾中同名的幀一起處理。"
+            "1（預設）產生全部。"),
+    KO("n 장마다 한 장만 맵을 만듭니다 (파일 이름 순). 카메라 폴더마다 같은 이름의 "
+       "프레임은 함께 다룹니다. 1 (기본값) 이면 모두 만듭니다."),
+    DE("Karten nur für jedes n-te Bild, nach Dateiname; gleichnamige Bilder in "
+       "mehreren Kameraordnern bleiben zusammen. 1 (Standard) erstellt alle."),
+    FR("Cartes pour une image sur n seulement, par nom de fichier ; les images de "
+       "même nom dans plusieurs dossiers de caméra restent ensemble. 1 (défaut) les fait toutes."),
+    ES("Mapas solo para una de cada n imágenes, por nombre de archivo; las del mismo "
+       "nombre en varias carpetas de cámara van juntas. 1 (por defecto) las hace todas."),
+    PT("Mapas só para uma em cada n imagens, por nome de ficheiro; as do mesmo nome "
+       "em várias pastas de câmara ficam juntas. 1 (padrão) faz todas."),
+    IT("Mappe solo per un'immagine ogni n, per nome di file; quelle con lo stesso "
+       "nome in più cartelle di camera restano insieme. 1 (predefinito) le fa tutte."),
+    NL("Kaarten alleen voor elk n-de beeld, op bestandsnaam; beelden met dezelfde "
+       "naam in meerdere cameramappen blijven samen. 1 (standaard) maakt ze allemaal."),
+    RU("Карты только для каждого n-го кадра по имени файла; кадры с одним именем в "
+       "папках разных камер идут вместе. 1 (по умолчанию) делает все."),
+    TR("Haritalar yalnızca her n'inci kare için, dosya adına göre; birden çok kamera "
+       "klasöründe aynı adlı kareler birlikte kalır. 1 (varsayılan) hepsini yapar."));
+
 SS_MSG(opt_overwrite,
     EN("Recompute maps that are already on disk. Without it a run continues "
        "where the last one stopped."),

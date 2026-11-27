@@ -89,6 +89,12 @@ public:
     // several. Marigold v2 runs those of a size as one batch.
     std::vector<GeometryPrediction> predictBatch(const std::vector<const float*>& rgb,
                                                  const std::vector<GeometryRequest>& reqs);
+    // predictBatch() with its host half held back: the device work is done when
+    // this returns, and the returned call finishes the same answers on any
+    // thread, while the device runs the next batch.
+    using Finish = std::function<std::vector<GeometryPrediction>()>;
+    Finish predictBatchDeferred(const std::vector<const float*>& rgb,
+                                const std::vector<GeometryRequest>& reqs);
     // Faces of this request's size one batch should hold; 1 where batching
     // buys nothing.
     int batchCapacity(const GeometryRequest& req);
